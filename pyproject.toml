@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-neon"
+version = "0.1.0"
+description = "Pytest plugin for Neon database branch isolation in tests"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+keywords = ["pytest", "neon", "postgres", "testing", "database", "branching"]
+authors = [{ name = "Zain" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Pytest",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Database",
+]
+dependencies = [
+    "pytest>=7.0",
+    "neon-api>=0.1.0",
+]
+
+[project.optional-dependencies]
+psycopg2 = ["psycopg2-binary>=2.9"]
+psycopg = ["psycopg[binary]>=3.1"]
+sqlalchemy = ["sqlalchemy>=2.0"]
+dev = [
+    "ruff>=0.8",
+    "mypy>=1.0",
+    "pytest-cov>=4.0",
+    "pytest-mock>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zain/pytest-neon"
+Repository = "https://github.com/zain/pytest-neon"
+Issues = "https://github.com/zain/pytest-neon/issues"
+
+[project.entry-points.pytest11]
+neon = "pytest_neon.plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pytest_neon"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
