@@ -1,7 +1,5 @@
 """Tests for branch creation, deletion, and lifecycle management."""
 
-import pytest
-
 
 class TestBranchLifecycle:
     """Test branch create/delete behavior."""
@@ -63,7 +61,7 @@ class TestBranchLifecycle:
 
             @pytest.fixture(scope="module")
             def neon_branch(request):
-                keep_branches = request.config.getoption("neon_keep_branches", default=False)
+                keep = request.config.getoption("neon_keep_branches", default=False)
                 api_calls.append("branch_create")
 
                 branch_info = NeonBranch(
@@ -78,7 +76,7 @@ class TestBranchLifecycle:
                     yield branch_info
                 finally:
                     os.environ.pop("DATABASE_URL", None)
-                    if not keep_branches:
+                    if not keep:
                         api_calls.append("branch_delete")
 
             @pytest.fixture(scope="session", autouse=True)

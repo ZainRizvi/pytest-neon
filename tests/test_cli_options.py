@@ -1,7 +1,5 @@
 """Tests for CLI option handling."""
 
-import pytest
-
 
 class TestCliOptionPassing:
     """Test that CLI options are correctly passed to fixtures."""

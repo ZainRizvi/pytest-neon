@@ -1,7 +1,5 @@
 """Tests for skip behavior when credentials are not configured."""
 
-import pytest
-
 
 class TestSkipWithoutCredentials:
     """Test that neon_branch skips gracefully when not configured."""

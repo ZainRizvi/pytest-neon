@@ -1,12 +1,12 @@
 """Tests for convenience fixture error messages when dependencies are missing."""
 
-import pytest
-
 
 class TestMissingDependencyErrors:
-    """Test that missing optional dependencies produce clear, actionable error messages."""
+    """Test that missing optional deps produce clear, actionable error messages."""
 
-    def test_missing_dependency_shows_install_command(self, pytester, mock_neon_branch_fixture_code):
+    def test_missing_dependency_shows_install_command(
+        self, pytester, mock_neon_branch_fixture_code
+    ):
         """Test that missing optional dependency shows how to fix it."""
         pytester.makeconftest(
             mock_neon_branch_fixture_code

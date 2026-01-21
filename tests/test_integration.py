@@ -91,11 +91,13 @@ class TestRealDatabaseConnectivity:
         except ImportError:
             pytest.skip("psycopg not installed - run: pip install pytest-neon[psycopg]")
 
-        with psycopg.connect(neon_branch.connection_string) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 AS result")
-                result = cur.fetchone()
-                assert result[0] == 1
+        with (
+            psycopg.connect(neon_branch.connection_string) as conn,
+            conn.cursor() as cur,
+        ):
+            cur.execute("SELECT 1 AS result")
+            result = cur.fetchone()
+            assert result[0] == 1
 
     def test_can_create_and_query_table(self, neon_branch):
         """Test that we can create tables and insert data."""
@@ -104,26 +106,28 @@ class TestRealDatabaseConnectivity:
         except ImportError:
             pytest.skip("psycopg not installed - run: pip install pytest-neon[psycopg]")
 
-        with psycopg.connect(neon_branch.connection_string) as conn:
-            with conn.cursor() as cur:
-                # Create a test table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS pytest_neon_test (
-                        id SERIAL PRIMARY KEY,
-                        name TEXT NOT NULL
-                    )
-                """)
-                # Insert data
-                cur.execute(
-                    "INSERT INTO pytest_neon_test (name) VALUES (%s) RETURNING id",
-                    ("test_value",),
+        with (
+            psycopg.connect(neon_branch.connection_string) as conn,
+            conn.cursor() as cur,
+        ):
+            # Create a test table
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pytest_neon_test (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL
                 )
-                inserted_id = cur.fetchone()[0]
-                conn.commit()
+            """)
+            # Insert data
+            cur.execute(
+                "INSERT INTO pytest_neon_test (name) VALUES (%s) RETURNING id",
+                ("test_value",),
+            )
+            inserted_id = cur.fetchone()[0]
+            conn.commit()
 
-                # Query it back
-                cur.execute(
-                    "SELECT name FROM pytest_neon_test WHERE id = %s", (inserted_id,)
-                )
-                result = cur.fetchone()
-                assert result[0] == "test_value"
+            # Query it back
+            cur.execute(
+                "SELECT name FROM pytest_neon_test WHERE id = %s", (inserted_id,)
+            )
+            result = cur.fetchone()
+            assert result[0] == "test_value"

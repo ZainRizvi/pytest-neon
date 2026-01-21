@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Generator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generator
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from neon_api import NeonAPI
@@ -69,13 +70,16 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         dest="neon_branch_expiry",
         type=int,
         default=DEFAULT_BRANCH_EXPIRY_SECONDS,
-        help=f"Branch auto-expiry in seconds (default: {DEFAULT_BRANCH_EXPIRY_SECONDS}). Set to 0 to disable.",
+        help=(
+            f"Branch auto-expiry in seconds "
+            f"(default: {DEFAULT_BRANCH_EXPIRY_SECONDS}). Set to 0 to disable."
+        ),
     )
     group.addoption(
         "--neon-env-var",
         dest="neon_env_var",
         default="DATABASE_URL",
-        help="Environment variable to set with connection string (default: DATABASE_URL)",
+        help="Environment variable to set with connection string (default: DATABASE_URL)",  # noqa: E501
     )
 
 
@@ -107,7 +111,7 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
     - --neon-api-key and --neon-project-id command line options
 
     Yields:
-        NeonBranch: Object containing branch_id, project_id, connection_string, and host.
+        NeonBranch: Object with branch_id, project_id, connection_string, and host.
 
     Example:
         def test_database_operation(neon_branch):
@@ -128,13 +132,20 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
     )
     role_name = _get_config_value(config, "neon_role", "NEON_ROLE", "neondb_owner")
     keep_branches = config.getoption("neon_keep_branches", default=False)
-    branch_expiry = config.getoption("neon_branch_expiry", default=DEFAULT_BRANCH_EXPIRY_SECONDS)
+    branch_expiry = config.getoption(
+        "neon_branch_expiry", default=DEFAULT_BRANCH_EXPIRY_SECONDS
+    )
     env_var_name = config.getoption("neon_env_var", default="DATABASE_URL")
 
     if not api_key:
-        pytest.skip("Neon API key not configured (set NEON_API_KEY or use --neon-api-key)")
+        pytest.skip(
+            "Neon API key not configured (set NEON_API_KEY or use --neon-api-key)"
+        )
     if not project_id:
-        pytest.skip("Neon project ID not configured (set NEON_PROJECT_ID or use --neon-project-id)")
+        pytest.skip(
+            "Neon project ID not configured "
+            "(set NEON_PROJECT_ID or use --neon-project-id)"
+        )
 
     neon = NeonAPI(api_key=api_key)
 
@@ -160,7 +171,8 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
 
     branch = result.branch
 
-    # Get endpoint_id from operations (branch_create returns operations, not endpoints directly)
+    # Get endpoint_id from operations
+    # (branch_create returns operations, not endpoints directly)
     endpoint_id = None
     for op in result.operations:
         if op.endpoint_id:
@@ -177,7 +189,9 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
     waited = 0.0
 
     while True:
-        endpoint_response = neon.endpoint(project_id=project_id, endpoint_id=endpoint_id)
+        endpoint_response = neon.endpoint(
+            project_id=project_id, endpoint_id=endpoint_id
+        )
         endpoint = endpoint_response.endpoint
         state = endpoint.current_state
 
@@ -195,7 +209,8 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
 
     host = endpoint.host
 
-    # Reset password to get the password value (newly created branches don't expose password)
+    # Reset password to get the password value
+    # (newly created branches don't expose password)
     password_response = neon.role_password_reset(
         project_id=project_id,
         branch_id=branch.id,
@@ -205,8 +220,7 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
 
     # Build connection string
     connection_string = (
-        f"postgresql://{role_name}:{password}@{host}/{database_name}"
-        "?sslmode=require"
+        f"postgresql://{role_name}:{password}@{host}/{database_name}?sslmode=require"
     )
 
     neon_branch_info = NeonBranch(
@@ -237,7 +251,10 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
                 # Log but don't fail tests due to cleanup issues
                 import warnings
 
-                warnings.warn(f"Failed to delete Neon branch {branch.id}: {e}")
+                warnings.warn(
+                    f"Failed to delete Neon branch {branch.id}: {e}",
+                    stacklevel=2,
+                )
 
 
 @pytest.fixture

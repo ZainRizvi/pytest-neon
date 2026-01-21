@@ -1,7 +1,5 @@
 """Tests for DATABASE_URL environment variable handling."""
 
-import pytest
-
 
 class TestEnvVarRestoration:
     """Test that DATABASE_URL is properly restored after fixture."""
@@ -25,22 +23,22 @@ class TestEnvVarRestoration:
                     host="mock.neon.tech",
                 )
 
-                env_var_name = "DATABASE_URL"
-                original_env_value = os.environ.get(env_var_name)
-                os.environ[env_var_name] = branch_info.connection_string
+                env_name = "DATABASE_URL"
+                original_env_value = os.environ.get(env_name)
+                os.environ[env_name] = branch_info.connection_string
 
                 try:
                     yield branch_info
                 finally:
                     if original_env_value is None:
-                        os.environ.pop(env_var_name, None)
+                        os.environ.pop(env_name, None)
                     else:
-                        os.environ[env_var_name] = original_env_value
+                        os.environ[env_name] = original_env_value
 
             @pytest.fixture(scope="session", autouse=True)
             def verify_cleanup():
                 yield
-                assert "DATABASE_URL" not in os.environ, "DATABASE_URL should have been removed"
+                assert "DATABASE_URL" not in os.environ, "DATABASE_URL not removed"
             """
         )
 
@@ -76,17 +74,17 @@ class TestEnvVarRestoration:
                     host="mock.neon.tech",
                 )
 
-                env_var_name = "DATABASE_URL"
-                original_env_value = os.environ.get(env_var_name)
-                os.environ[env_var_name] = branch_info.connection_string
+                env_name = "DATABASE_URL"
+                original_env_value = os.environ.get(env_name)
+                os.environ[env_name] = branch_info.connection_string
 
                 try:
                     yield branch_info
                 finally:
                     if original_env_value is None:
-                        os.environ.pop(env_var_name, None)
+                        os.environ.pop(env_name, None)
                     else:
-                        os.environ[env_var_name] = original_env_value
+                        os.environ[env_name] = original_env_value
 
             @pytest.fixture(scope="session", autouse=True)
             def verify_restoration():
@@ -127,17 +125,17 @@ class TestEnvVarRestoration:
                     host="mock.neon.tech",
                 )
 
-                env_var_name = "DATABASE_URL"
-                original_env_value = os.environ.get(env_var_name)
-                os.environ[env_var_name] = branch_info.connection_string
+                env_name = "DATABASE_URL"
+                original_env_value = os.environ.get(env_name)
+                os.environ[env_name] = branch_info.connection_string
 
                 try:
                     yield branch_info
                 finally:
                     if original_env_value is None:
-                        os.environ.pop(env_var_name, None)
+                        os.environ.pop(env_name, None)
                     else:
-                        os.environ[env_var_name] = original_env_value
+                        os.environ[env_name] = original_env_value
 
             @pytest.fixture(scope="session", autouse=True)
             def verify_restoration():
@@ -160,7 +158,7 @@ class TestEnvVarRestoration:
 class TestCustomEnvVar:
     """Test using a custom environment variable name."""
 
-    def test_custom_env_var_name(self, pytester):
+    def test_custom_env_name(self, pytester):
         """Test that --neon-env-var sets a custom env var instead of DATABASE_URL."""
         pytester.makeconftest(
             """
@@ -170,7 +168,9 @@ class TestCustomEnvVar:
 
             @pytest.fixture(scope="module")
             def neon_branch(request):
-                env_var_name = request.config.getoption("neon_env_var", default="DATABASE_URL")
+                env_name = request.config.getoption(
+                    "neon_env_var", default="DATABASE_URL"
+                )
 
                 branch_info = NeonBranch(
                     branch_id="br-mock-123",
@@ -179,16 +179,16 @@ class TestCustomEnvVar:
                     host="mock.neon.tech",
                 )
 
-                original_env_value = os.environ.get(env_var_name)
-                os.environ[env_var_name] = branch_info.connection_string
+                original_env_value = os.environ.get(env_name)
+                os.environ[env_name] = branch_info.connection_string
 
                 try:
                     yield branch_info
                 finally:
                     if original_env_value is None:
-                        os.environ.pop(env_var_name, None)
+                        os.environ.pop(env_name, None)
                     else:
-                        os.environ[env_var_name] = original_env_value
+                        os.environ[env_name] = original_env_value
             """
         )
 
