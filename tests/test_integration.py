@@ -87,7 +87,7 @@ class TestMigrations:
     def test_migrations_persist_across_resets(self, pytester, tmp_path):
         """Test that migrations run once and persist across test resets."""
         # Write a conftest that tracks migration and verifies table exists
-        conftest = f"""
+        conftest = """
 import os
 import pytest
 

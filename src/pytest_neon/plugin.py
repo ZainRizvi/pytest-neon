@@ -340,9 +340,10 @@ def _neon_migration_branch(
     allow creating child branches from branches with expiration dates.
     Cleanup relies on the fixture teardown at session end.
     """
+    # No expiry - Neon doesn't allow children from branches with expiry
     yield from _create_neon_branch(
         request,
-        branch_expiry_override=0,  # No expiry - Neon doesn't allow children from expiring branches
+        branch_expiry_override=0,
         branch_name_suffix="-migrated",
     )
 
