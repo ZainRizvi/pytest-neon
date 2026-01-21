@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generator
 
@@ -158,26 +159,66 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
     )
 
     branch = result.branch
-    endpoint = result.endpoints[0]
 
-    # Get connection URI
-    conn_uri = neon.connection_uri(
+    # Get endpoint_id from operations (branch_create returns operations, not endpoints directly)
+    endpoint_id = None
+    for op in result.operations:
+        if op.endpoint_id:
+            endpoint_id = op.endpoint_id
+            break
+
+    if not endpoint_id:
+        raise RuntimeError(f"No endpoint created for branch {branch.id}")
+
+    # Wait for endpoint to be ready (it starts in "init" state)
+    # Endpoints typically become active in 1-2 seconds
+    max_wait_seconds = 60
+    poll_interval = 0.5
+    waited = 0.0
+
+    while True:
+        endpoint_response = neon.endpoint(project_id=project_id, endpoint_id=endpoint_id)
+        endpoint = endpoint_response.endpoint
+        state = endpoint.current_state
+
+        if state == "active" or str(state) == "EndpointState.active":
+            break
+
+        if waited >= max_wait_seconds:
+            raise RuntimeError(
+                f"Timeout waiting for endpoint {endpoint_id} to become active "
+                f"(current state: {state})"
+            )
+
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    host = endpoint.host
+
+    # Reset password to get the password value (newly created branches don't expose password)
+    password_response = neon.role_password_reset(
         project_id=project_id,
         branch_id=branch.id,
-        database_name=database_name,
         role_name=role_name,
+    )
+    password = password_response.role.password
+
+    # Build connection string
+    connection_string = (
+        f"postgresql://{role_name}:{password}@{host}/{database_name}"
+        "?sslmode=require"
     )
 
     neon_branch_info = NeonBranch(
         branch_id=branch.id,
         project_id=project_id,
-        connection_string=conn_uri.uri,
-        host=endpoint.host,
+        connection_string=connection_string,
+        host=host,
     )
 
     # Set DATABASE_URL (or configured env var) for the duration of the test module
     original_env_value = os.environ.get(env_var_name)
-    os.environ[env_var_name] = conn_uri.uri
+    os.environ[env_var_name] = connection_string
 
     try:
         yield neon_branch_info
