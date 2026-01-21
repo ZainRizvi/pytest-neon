@@ -1,5 +1,7 @@
 # pytest-neon
 
+[![Tests](https://github.com/zainab-ali/pytest-neon/actions/workflows/tests.yml/badge.svg)](https://github.com/zainab-ali/pytest-neon/actions/workflows/tests.yml)
+
 Pytest plugin for [Neon](https://neon.tech) database branch isolation in tests.
 
 Each test gets its own isolated database state via Neon's instant branching and reset features. Branches are automatically cleaned up after tests complete.
