@@ -302,15 +302,24 @@ def neon_branch_isolated(
     yield from _create_neon_branch(request)
 
 
-def _reset_branch_to_parent(api_key: str, project_id: str, branch_id: str) -> None:
+def _reset_branch_to_parent(
+    neon: NeonAPI, project_id: str, branch_id: str, api_key: str
+) -> None:
     """Reset a branch to its parent's state using the Neon API."""
+    # Get branch details to find parent_id
+    branch_response = neon.branch(project_id=project_id, branch_id=branch_id)
+    parent_id = branch_response.branch.parent_id
+
+    if not parent_id:
+        raise RuntimeError(f"Branch {branch_id} has no parent - cannot reset")
+
+    # Use the restore endpoint with parent branch ID
     url = f"https://console.neon.tech/api/v2/projects/{project_id}/branches/{branch_id}/restore"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    # Reset to parent branch
-    response = requests.post(url, headers=headers, json={"source_branch_id": "parent"})
+    response = requests.post(url, headers=headers, json={"source_branch_id": parent_id})
     response.raise_for_status()
 
 
@@ -358,10 +367,12 @@ def neon_branch_reset(
     # Reset branch to parent state after each test
     if api_key:
         try:
+            neon = NeonAPI(api_key=api_key)
             _reset_branch_to_parent(
-                api_key=api_key,
+                neon=neon,
                 project_id=_neon_branch_for_reset.project_id,
                 branch_id=_neon_branch_for_reset.branch_id,
+                api_key=api_key,
             )
         except Exception as e:
             import warnings
