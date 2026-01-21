@@ -94,32 +94,14 @@ def _get_config_value(
     return os.environ.get(env_var, default)
 
 
-@pytest.fixture(scope="module")
-def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, None]:
+def _create_neon_branch(
+    request: pytest.FixtureRequest,
+) -> Generator[NeonBranch, None, None]:
     """
-    Create an isolated Neon database branch for each test module.
+    Internal helper that creates and manages a Neon branch lifecycle.
 
-    The branch is automatically deleted after all tests in the module complete,
-    unless --neon-keep-branches is specified. Branches also auto-expire after
-    10 minutes by default (configurable via --neon-branch-expiry) as a safety net
-    for interrupted test runs.
-
-    The connection string is automatically set in the DATABASE_URL environment
-    variable (configurable via --neon-env-var) for the duration of the test module.
-
-    Requires either:
-    - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
-    - --neon-api-key and --neon-project-id command line options
-
-    Yields:
-        NeonBranch: Object with branch_id, project_id, connection_string, and host.
-
-    Example:
-        def test_database_operation(neon_branch):
-            # DATABASE_URL is automatically set
-            conn_string = os.environ["DATABASE_URL"]
-            # or use directly
-            conn_string = neon_branch.connection_string
+    This is the core implementation used by both module-scoped and function-scoped
+    branch fixtures.
     """
     config = request.config
 
@@ -232,7 +214,7 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
         host=host,
     )
 
-    # Set DATABASE_URL (or configured env var) for the duration of the test module
+    # Set DATABASE_URL (or configured env var) for the duration of the fixture scope
     original_env_value = os.environ.get(env_var_name)
     os.environ[env_var_name] = connection_string
 
@@ -257,6 +239,66 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
                     f"Failed to delete Neon branch {branch.id}: {e}",
                     stacklevel=2,
                 )
+
+
+@pytest.fixture(scope="module")
+def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, None]:
+    """
+    Create an isolated Neon database branch for each test module.
+
+    The branch is automatically deleted after all tests in the module complete,
+    unless --neon-keep-branches is specified. Branches also auto-expire after
+    10 minutes by default (configurable via --neon-branch-expiry) as a safety net
+    for interrupted test runs.
+
+    The connection string is automatically set in the DATABASE_URL environment
+    variable (configurable via --neon-env-var) for the duration of the test module.
+
+    Requires either:
+    - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
+    - --neon-api-key and --neon-project-id command line options
+
+    Yields:
+        NeonBranch: Object with branch_id, project_id, connection_string, and host.
+
+    Example:
+        def test_database_operation(neon_branch):
+            # DATABASE_URL is automatically set
+            conn_string = os.environ["DATABASE_URL"]
+            # or use directly
+            conn_string = neon_branch.connection_string
+    """
+    yield from _create_neon_branch(request)
+
+
+@pytest.fixture(scope="function")
+def neon_branch_isolated(
+    request: pytest.FixtureRequest,
+) -> Generator[NeonBranch, None, None]:
+    """
+    Create an isolated Neon database branch for each individual test.
+
+    Unlike `neon_branch` (module-scoped), this fixture creates a fresh branch
+    for every test function, providing complete isolation between tests.
+
+    Use this when:
+    - Tests modify database state and you need guaranteed isolation
+    - You want to ensure no test pollution between test functions
+    - Tests run in parallel and need separate databases
+
+    Note: Creating a branch per test is slower than sharing a module-scoped
+    branch. Use `neon_branch` when tests can share state or clean up after
+    themselves.
+
+    Yields:
+        NeonBranch: Object with branch_id, project_id, connection_string, and host.
+
+    Example:
+        def test_isolated_operation(neon_branch_isolated):
+            # Each test gets its own fresh branch
+            conn_string = neon_branch_isolated.connection_string
+    """
+    yield from _create_neon_branch(request)
 
 
 @pytest.fixture
