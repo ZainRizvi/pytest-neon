@@ -19,8 +19,13 @@ from pytest_neon.plugin import NeonBranch
 @pytest.fixture(scope="module")
 def neon_branch(request):
     """Mock neon_branch fixture for testing."""
-    keep_branches = request.config.getoption("neon_keep_branches", default=False)
-    env_var_name = request.config.getoption("neon_env_var", default="DATABASE_URL")
+    keep_branches = request.config.getoption("neon_keep_branches", default=None)
+    if keep_branches is None:
+        keep_branches = False
+
+    env_var_name = request.config.getoption("neon_env_var", default=None)
+    if env_var_name is None:
+        env_var_name = "DATABASE_URL"
 
     branch_info = NeonBranch(
         branch_id="br-mock-123",

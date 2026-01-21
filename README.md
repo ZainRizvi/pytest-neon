@@ -78,6 +78,7 @@ Returns a `NeonBranch` dataclass with:
 - `project_id`: The Neon project ID
 - `connection_string`: Full PostgreSQL connection URI
 - `host`: The database host
+- `parent_id`: The parent branch ID (used for resets)
 
 ```python
 import os
@@ -194,6 +195,30 @@ pytest --neon-branch-expiry=0
 # Use a different env var
 pytest --neon-env-var=TEST_DATABASE_URL
 ```
+
+### pyproject.toml / pytest.ini
+
+You can also configure options in your `pyproject.toml`:
+
+```toml
+[tool.pytest.ini_options]
+neon_database = "mydb"
+neon_role = "myrole"
+neon_keep_branches = true
+neon_branch_expiry = "300"
+```
+
+Or in `pytest.ini`:
+
+```ini
+[pytest]
+neon_database = mydb
+neon_role = myrole
+neon_keep_branches = true
+neon_branch_expiry = 300
+```
+
+**Priority order**: CLI options > environment variables > ini settings > defaults
 
 ## CI/CD Integration
 

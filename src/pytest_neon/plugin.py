@@ -30,9 +30,10 @@ class NeonBranch:
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    """Add Neon-specific command line options."""
+    """Add Neon-specific command line options and ini settings."""
     group = parser.getgroup("neon", "Neon database branching")
 
+    # CLI options
     group.addoption(
         "--neon-api-key",
         dest="neon_api_key",
@@ -51,13 +52,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption(
         "--neon-database",
         dest="neon_database",
-        default="neondb",
         help="Database name (default: neondb)",
     )
     group.addoption(
         "--neon-role",
         dest="neon_role",
-        default="neondb_owner",
         help="Database role (default: neondb_owner)",
     )
     group.addoption(
@@ -70,7 +69,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--neon-branch-expiry",
         dest="neon_branch_expiry",
         type=int,
-        default=DEFAULT_BRANCH_EXPIRY_SECONDS,
         help=(
             f"Branch auto-expiry in seconds "
             f"(default: {DEFAULT_BRANCH_EXPIRY_SECONDS}). Set to 0 to disable."
@@ -79,19 +77,62 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     group.addoption(
         "--neon-env-var",
         dest="neon_env_var",
-        default="DATABASE_URL",
         help="Environment variable to set with connection string (default: DATABASE_URL)",  # noqa: E501
+    )
+
+    # INI file settings (pytest.ini, pyproject.toml, etc.)
+    parser.addini("neon_api_key", "Neon API key", default=None)
+    parser.addini("neon_project_id", "Neon project ID", default=None)
+    parser.addini("neon_parent_branch", "Parent branch ID", default=None)
+    parser.addini("neon_database", "Database name", default="neondb")
+    parser.addini("neon_role", "Database role", default="neondb_owner")
+    parser.addini(
+        "neon_keep_branches",
+        "Don't delete branches after tests",
+        type="bool",
+        default=False,
+    )
+    parser.addini(
+        "neon_branch_expiry",
+        "Branch auto-expiry in seconds",
+        default=str(DEFAULT_BRANCH_EXPIRY_SECONDS),
+    )
+    parser.addini(
+        "neon_env_var",
+        "Environment variable for connection string",
+        default="DATABASE_URL",
     )
 
 
 def _get_config_value(
-    config: pytest.Config, option: str, env_var: str, default: str | None = None
+    config: pytest.Config,
+    option: str,
+    env_var: str,
+    ini_name: str | None = None,
+    default: str | None = None,
 ) -> str | None:
-    """Get config value from CLI option, env var, or default."""
+    """Get config value from CLI option, env var, ini setting, or default.
+
+    Priority order: CLI option > environment variable > ini setting > default
+    """
+    # 1. CLI option (highest priority)
     value = config.getoption(option, default=None)
     if value is not None:
         return value
-    return os.environ.get(env_var, default)
+
+    # 2. Environment variable
+    env_value = os.environ.get(env_var)
+    if env_value is not None:
+        return env_value
+
+    # 3. INI setting (pytest.ini, pyproject.toml, etc.)
+    if ini_name is not None:
+        ini_value = config.getini(ini_name)
+        if ini_value:
+            return ini_value
+
+    # 4. Default
+    return default
 
 
 def _create_neon_branch(
@@ -104,20 +145,32 @@ def _create_neon_branch(
     """
     config = request.config
 
-    api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY")
-    project_id = _get_config_value(config, "neon_project_id", "NEON_PROJECT_ID")
+    api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY", "neon_api_key")
+    project_id = _get_config_value(
+        config, "neon_project_id", "NEON_PROJECT_ID", "neon_project_id"
+    )
     parent_branch_id = _get_config_value(
-        config, "neon_parent_branch", "NEON_PARENT_BRANCH_ID"
+        config, "neon_parent_branch", "NEON_PARENT_BRANCH_ID", "neon_parent_branch"
     )
     database_name = _get_config_value(
-        config, "neon_database", "NEON_DATABASE", "neondb"
+        config, "neon_database", "NEON_DATABASE", "neon_database", "neondb"
     )
-    role_name = _get_config_value(config, "neon_role", "NEON_ROLE", "neondb_owner")
-    keep_branches = config.getoption("neon_keep_branches", default=False)
-    branch_expiry = config.getoption(
-        "neon_branch_expiry", default=DEFAULT_BRANCH_EXPIRY_SECONDS
+    role_name = _get_config_value(
+        config, "neon_role", "NEON_ROLE", "neon_role", "neondb_owner"
     )
-    env_var_name = config.getoption("neon_env_var", default="DATABASE_URL")
+
+    # For boolean/int options, check CLI first, then ini
+    keep_branches = config.getoption("neon_keep_branches", default=None)
+    if keep_branches is None:
+        keep_branches = config.getini("neon_keep_branches")
+
+    branch_expiry = config.getoption("neon_branch_expiry", default=None)
+    if branch_expiry is None:
+        branch_expiry = int(config.getini("neon_branch_expiry"))
+
+    env_var_name = _get_config_value(
+        config, "neon_env_var", "", "neon_env_var", "DATABASE_URL"
+    )
 
     if not api_key:
         pytest.skip(
@@ -301,7 +354,7 @@ def neon_branch(
             conn_string = neon_branch.connection_string
     """
     config = request.config
-    api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY")
+    api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY", "neon_api_key")
 
     # Validate that branch has a parent for reset functionality
     if not _neon_branch_for_reset.parent_id:
