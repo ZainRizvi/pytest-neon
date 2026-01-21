@@ -234,6 +234,28 @@ jobs:
 
 Branches use copy-on-write storage, so you only pay for data that differs from the parent branch.
 
+### What Reset Does
+
+The `neon_branch` fixture uses Neon's branch restore API to reset database state after each test:
+
+- **Data changes are reverted**: All INSERT, UPDATE, DELETE operations are undone
+- **Schema changes are reverted**: CREATE TABLE, ALTER TABLE, DROP TABLE, etc. are undone
+- **Sequences are reset**: Auto-increment counters return to parent state
+- **Complete rollback**: The branch is restored to the exact state of the parent at the time the child branch was created
+
+This is similar to database transactions but at the branch level.
+
+## Limitations
+
+### Parallel Test Execution
+
+This plugin sets the `DATABASE_URL` environment variable, which is process-global. This means it is **not compatible with pytest-xdist** or other parallel test runners that run tests in the same process.
+
+If you need parallel execution, you can:
+- Use `neon_branch.connection_string` directly instead of relying on `DATABASE_URL`
+- Run with `pytest-xdist --dist=loadfile` to keep modules in separate processes
+- Run tests serially (default pytest behavior)
+
 ## Troubleshooting
 
 ### "psycopg not installed" or "psycopg2 not installed"

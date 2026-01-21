@@ -7,14 +7,12 @@ import time
 from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import pytest
 import requests
 from neon_api import NeonAPI
-
-if TYPE_CHECKING:
-    pass
+from neon_api.schema import EndpointState
 
 # Default branch expiry in seconds (10 minutes)
 DEFAULT_BRANCH_EXPIRY_SECONDS = 600
@@ -168,9 +166,10 @@ def _create_neon_branch(
         raise RuntimeError(f"No endpoint created for branch {branch.id}")
 
     # Wait for endpoint to be ready (it starts in "init" state)
-    # Endpoints typically become active in 1-2 seconds
+    # Endpoints typically become active in 1-2 seconds, but we allow up to 60s
+    # to handle occasional Neon API slowness or high load scenarios
     max_wait_seconds = 60
-    poll_interval = 0.5
+    poll_interval = 0.5  # Poll every 500ms for responsive feedback
     waited = 0.0
 
     while True:
@@ -180,7 +179,7 @@ def _create_neon_branch(
         endpoint = endpoint_response.endpoint
         state = endpoint.current_state
 
-        if state == "active" or str(state) == "EndpointState.active":
+        if state == EndpointState.active:
             break
 
         if waited >= max_wait_seconds:
@@ -254,7 +253,7 @@ def _reset_branch_to_parent(branch: NeonBranch, api_key: str) -> None:
         "Content-Type": "application/json",
     }
     response = requests.post(
-        url, headers=headers, json={"source_branch_id": branch.parent_id}
+        url, headers=headers, json={"source_branch_id": branch.parent_id}, timeout=30
     )
     response.raise_for_status()
 
@@ -304,6 +303,15 @@ def neon_branch(
     config = request.config
     api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY")
 
+    # Validate that branch has a parent for reset functionality
+    if not _neon_branch_for_reset.parent_id:
+        pytest.fail(
+            f"\n\nBranch {_neon_branch_for_reset.branch_id} has no parent. "
+            f"The neon_branch fixture requires a parent branch for reset.\n\n"
+            f"Use neon_branch_shared if you don't need reset, or specify "
+            f"a parent branch with --neon-parent-branch or NEON_PARENT_BRANCH_ID."
+        )
+
     yield _neon_branch_for_reset
 
     # Reset branch to parent state after each test
@@ -311,11 +319,11 @@ def neon_branch(
         try:
             _reset_branch_to_parent(branch=_neon_branch_for_reset, api_key=api_key)
         except Exception as e:
-            import warnings
-
-            warnings.warn(
-                f"Failed to reset branch {_neon_branch_for_reset.branch_id}: {e}",
-                stacklevel=2,
+            pytest.fail(
+                f"\n\nFailed to reset branch {_neon_branch_for_reset.branch_id} "
+                f"after test. Subsequent tests in this module may see dirty "
+                f"database state.\n\nError: {e}\n\n"
+                f"To keep the branch for debugging, use --neon-keep-branches"
             )
 
 
