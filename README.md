@@ -1,6 +1,6 @@
 # pytest-neon
 
-[![Tests](https://github.com/zainab-ali/pytest-neon/actions/workflows/tests.yml/badge.svg)](https://github.com/zainab-ali/pytest-neon/actions/workflows/tests.yml)
+[![Tests](https://github.com/ZainRizvi/pytest-neon/actions/workflows/tests.yml/badge.svg)](https://github.com/ZainRizvi/pytest-neon/actions/workflows/tests.yml)
 
 Pytest plugin for [Neon](https://neon.tech) database branch isolation in tests.
 
