@@ -6,6 +6,7 @@ import os
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -157,16 +158,17 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
     if parent_branch_id:
         branch_config["parent_id"] = parent_branch_id
 
-    # Build endpoint config with optional expiry
-    endpoint_config: dict[str, Any] = {"type": "read_write"}
+    # Set branch expiration (auto-delete) as a safety net for interrupted test runs
+    # This uses the branch expires_at field, not endpoint suspend_timeout
     if branch_expiry and branch_expiry > 0:
-        endpoint_config["suspend_timeout_seconds"] = branch_expiry
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=branch_expiry)
+        branch_config["expires_at"] = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Create branch with compute endpoint
     result = neon.branch_create(
         project_id=project_id,
         branch=branch_config,
-        endpoints=[endpoint_config],
+        endpoints=[{"type": "read_write"}],
     )
 
     branch = result.branch
