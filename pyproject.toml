@@ -45,9 +45,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/zain/pytest-neon"
-Repository = "https://github.com/zain/pytest-neon"
-Issues = "https://github.com/zain/pytest-neon/issues"
+Homepage = "https://github.com/ZainRizvi/pytest-neon"
+Repository = "https://github.com/ZainRizvi/pytest-neon"
+Issues = "https://github.com/ZainRizvi/pytest-neon/issues"
 
 [project.entry-points.pytest11]
 neon = "pytest_neon.plugin"
