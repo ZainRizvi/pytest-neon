@@ -28,6 +28,7 @@ class NeonBranch:
     project_id: str
     connection_string: str
     host: str
+    parent_id: str | None = None
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -101,8 +102,7 @@ def _create_neon_branch(
     """
     Internal helper that creates and manages a Neon branch lifecycle.
 
-    This is the core implementation used by both module-scoped and function-scoped
-    branch fixtures.
+    This is the core implementation used by branch fixtures.
     """
     config = request.config
 
@@ -213,6 +213,7 @@ def _create_neon_branch(
         project_id=project_id,
         connection_string=connection_string,
         host=host,
+        parent_id=branch.parent_id,
     )
 
     # Set DATABASE_URL (or configured env var) for the duration of the fixture scope
@@ -242,10 +243,41 @@ def _create_neon_branch(
                 )
 
 
+def _reset_branch_to_parent(branch: NeonBranch, api_key: str) -> None:
+    """Reset a branch to its parent's state using the Neon API."""
+    if not branch.parent_id:
+        raise RuntimeError(f"Branch {branch.branch_id} has no parent - cannot reset")
+
+    url = f"https://console.neon.tech/api/v2/projects/{branch.project_id}/branches/{branch.branch_id}/restore"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    response = requests.post(
+        url, headers=headers, json={"source_branch_id": branch.parent_id}
+    )
+    response.raise_for_status()
+
+
 @pytest.fixture(scope="module")
-def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, None]:
+def _neon_branch_for_reset(
+    request: pytest.FixtureRequest,
+) -> Generator[NeonBranch, None, None]:
+    """Internal fixture that creates a branch for reset-based isolation."""
+    yield from _create_neon_branch(request)
+
+
+@pytest.fixture(scope="function")
+def neon_branch(
+    request: pytest.FixtureRequest,
+    _neon_branch_for_reset: NeonBranch,
+) -> Generator[NeonBranch, None, None]:
     """
-    Create an isolated Neon database branch for each test module.
+    Provide an isolated Neon database branch for each test.
+
+    This is the primary fixture for database testing. It creates one branch per
+    test module, then resets it to the parent branch's state after each test.
+    This provides test isolation with ~0.5s overhead per test.
 
     The branch is automatically deleted after all tests in the module complete,
     unless --neon-keep-branches is specified. Branches also auto-expire after
@@ -253,7 +285,7 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
     for interrupted test runs.
 
     The connection string is automatically set in the DATABASE_URL environment
-    variable (configurable via --neon-env-var) for the duration of the test module.
+    variable (configurable via --neon-env-var).
 
     Requires either:
     - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
@@ -269,96 +301,6 @@ def neon_branch(request: pytest.FixtureRequest) -> Generator[NeonBranch, None, N
             # or use directly
             conn_string = neon_branch.connection_string
     """
-    yield from _create_neon_branch(request)
-
-
-@pytest.fixture(scope="function")
-def neon_branch_isolated(
-    request: pytest.FixtureRequest,
-) -> Generator[NeonBranch, None, None]:
-    """
-    Create an isolated Neon database branch for each individual test.
-
-    Unlike `neon_branch` (module-scoped), this fixture creates a fresh branch
-    for every test function, providing complete isolation between tests.
-
-    Use this when:
-    - Tests modify database state and you need guaranteed isolation
-    - You want to ensure no test pollution between test functions
-    - Tests run in parallel and need separate databases
-
-    Note: Creating a branch per test is slower than sharing a module-scoped
-    branch. Use `neon_branch` when tests can share state or clean up after
-    themselves.
-
-    Yields:
-        NeonBranch: Object with branch_id, project_id, connection_string, and host.
-
-    Example:
-        def test_isolated_operation(neon_branch_isolated):
-            # Each test gets its own fresh branch
-            conn_string = neon_branch_isolated.connection_string
-    """
-    yield from _create_neon_branch(request)
-
-
-def _reset_branch_to_parent(
-    neon: NeonAPI, project_id: str, branch_id: str, api_key: str
-) -> None:
-    """Reset a branch to its parent's state using the Neon API."""
-    # Get branch details to find parent_id
-    branch_response = neon.branch(project_id=project_id, branch_id=branch_id)
-    parent_id = branch_response.branch.parent_id
-
-    if not parent_id:
-        raise RuntimeError(f"Branch {branch_id} has no parent - cannot reset")
-
-    # Use the restore endpoint with parent branch ID
-    url = f"https://console.neon.tech/api/v2/projects/{project_id}/branches/{branch_id}/restore"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    response = requests.post(url, headers=headers, json={"source_branch_id": parent_id})
-    response.raise_for_status()
-
-
-@pytest.fixture(scope="module")
-def _neon_branch_for_reset(
-    request: pytest.FixtureRequest,
-) -> Generator[NeonBranch, None, None]:
-    """Internal fixture that creates a branch for reset-based isolation."""
-    yield from _create_neon_branch(request)
-
-
-@pytest.fixture(scope="function")
-def neon_branch_reset(
-    request: pytest.FixtureRequest,
-    _neon_branch_for_reset: NeonBranch,
-) -> Generator[NeonBranch, None, None]:
-    """
-    Provide a Neon branch that resets to parent state after each test.
-
-    This fixture creates one branch per module (like `neon_branch`) but resets
-    it to the parent branch's state after each test completes. This provides
-    test isolation while being faster than creating a new branch per test.
-
-    Use this when:
-    - Tests modify database state and you need isolation
-    - You want faster test execution than `neon_branch_isolated`
-    - Your parent branch has the baseline schema/data you want to reset to
-
-    Note: Reset operation briefly interrupts connections. The branch is reset
-    AFTER each test, so the first test sees a fresh branch.
-
-    Yields:
-        NeonBranch: Object with branch_id, project_id, connection_string, and host.
-
-    Example:
-        def test_with_reset(neon_branch_reset):
-            # Make changes - they'll be reset after this test
-            conn_string = neon_branch_reset.connection_string
-    """
     config = request.config
     api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY")
 
@@ -367,13 +309,7 @@ def neon_branch_reset(
     # Reset branch to parent state after each test
     if api_key:
         try:
-            neon = NeonAPI(api_key=api_key)
-            _reset_branch_to_parent(
-                neon=neon,
-                project_id=_neon_branch_for_reset.project_id,
-                branch_id=_neon_branch_for_reset.branch_id,
-                api_key=api_key,
-            )
+            _reset_branch_to_parent(branch=_neon_branch_for_reset, api_key=api_key)
         except Exception as e:
             import warnings
 
@@ -381,6 +317,37 @@ def neon_branch_reset(
                 f"Failed to reset branch {_neon_branch_for_reset.branch_id}: {e}",
                 stacklevel=2,
             )
+
+
+@pytest.fixture(scope="module")
+def neon_branch_shared(
+    request: pytest.FixtureRequest,
+) -> Generator[NeonBranch, None, None]:
+    """
+    Provide a shared Neon database branch for all tests in a module.
+
+    This fixture creates one branch per test module and shares it across all
+    tests without resetting. This is the fastest option but tests can see
+    each other's data modifications.
+
+    Use this when:
+    - Tests are read-only or don't interfere with each other
+    - You manually clean up test data within each test
+    - Maximum speed is more important than isolation
+
+    Warning: Tests in the same module will share database state. Data created
+    by one test will be visible to subsequent tests. Use `neon_branch` instead
+    if you need isolation between tests.
+
+    Yields:
+        NeonBranch: Object with branch_id, project_id, connection_string, and host.
+
+    Example:
+        def test_read_only_query(neon_branch_shared):
+            # Fast: no reset between tests, but be careful about data leakage
+            conn_string = neon_branch_shared.connection_string
+    """
+    yield from _create_neon_branch(request)
 
 
 @pytest.fixture

@@ -2,12 +2,12 @@
 
 Pytest plugin for [Neon](https://neon.tech) database branch isolation in tests.
 
-Each test module gets its own isolated Neon database branch, created instantly via Neon's branching feature. Branches are automatically cleaned up after tests complete (with a 10-minute auto-expiry safety net for interrupted runs).
+Each test gets its own isolated database state via Neon's instant branching and reset features. Branches are automatically cleaned up after tests complete.
 
 ## Features
 
-- **Isolated test environments**: Each test module runs against its own database branch
-- **Instant branch creation**: Branches are created in ~1 second regardless of database size
+- **Isolated test environments**: Each test runs against a clean database state
+- **Fast resets**: ~0.5s per test to reset the branch (not create a new one)
 - **Automatic cleanup**: Branches are deleted after tests, with auto-expiry fallback
 - **Zero infrastructure**: No Docker, no local Postgres, no manual setup
 - **Real database testing**: Test against actual Postgres with your production schema
@@ -68,9 +68,9 @@ pytest
 
 ## Fixtures
 
-### `neon_branch` (core fixture)
+### `neon_branch` (default, recommended)
 
-Creates an isolated Neon branch for each test module. This is the primary fixture - it creates the branch and sets `DATABASE_URL` automatically.
+The primary fixture for database testing. Creates one branch per test module, then resets it to the parent branch's state after each test. This provides test isolation with ~0.5s overhead per test.
 
 Returns a `NeonBranch` dataclass with:
 
@@ -91,30 +91,26 @@ def test_branch_info(neon_branch):
     conn = psycopg.connect(neon_branch.connection_string)
 ```
 
-### `neon_branch_isolated` (function-scoped)
+**Performance**: ~1.5s initial setup per module + ~0.5s reset per test. For a module with 10 tests, expect ~6.5s total overhead.
 
-Creates a fresh branch for each individual test function, providing complete isolation between tests.
+### `neon_branch_shared` (fastest, no isolation)
 
-```python
-def test_isolated_operation(neon_branch_isolated):
-    # Each test gets its own fresh branch
-    # Changes here won't affect other tests
-    conn = psycopg.connect(neon_branch_isolated.connection_string)
-```
-
-Use this when tests modify database state and you need guaranteed isolation. Note that creating a branch per test is slower than sharing a module-scoped branch.
-
-### `neon_branch_reset` (reset after each test)
-
-Creates one branch per module but resets it to the parent branch's state after each test. This provides test isolation while being faster than creating a new branch per test.
+Creates one branch per test module and shares it across all tests without resetting. This is the fastest option but tests can see each other's data modifications.
 
 ```python
-def test_with_reset(neon_branch_reset):
-    # Make changes - they'll be reset after this test
-    conn = psycopg.connect(neon_branch_reset.connection_string)
+def test_read_only_query(neon_branch_shared):
+    # Fast: no reset between tests
+    # Warning: data from other tests in this module may be visible
+    conn = psycopg.connect(neon_branch_shared.connection_string)
 ```
 
-Use this when you want isolation between tests but faster execution than `neon_branch_isolated`.
+**Use this when**:
+- Tests are read-only
+- Tests don't interfere with each other
+- You manually clean up test data
+- Maximum speed is more important than isolation
+
+**Performance**: ~1.5s initial setup per module, no per-test overhead.
 
 ### `neon_connection_psycopg` (psycopg v3)
 
@@ -232,8 +228,9 @@ jobs:
 1. Before each test module, the plugin creates a new Neon branch from your parent branch
 2. `DATABASE_URL` is set to point to the new branch
 3. Tests run against this isolated branch with full access to your schema and data
-4. After tests complete, the branch is deleted (unless `--neon-keep-branches` is set)
-5. As a safety net, branches auto-expire after 10 minutes even if cleanup fails
+4. After each test, the branch is reset to its parent state (~0.5s)
+5. After all tests in the module complete, the branch is deleted
+6. As a safety net, branches auto-expire after 10 minutes even if cleanup fails
 
 Branches use copy-on-write storage, so you only pay for data that differs from the parent branch.
 
