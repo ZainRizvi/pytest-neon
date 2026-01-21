@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 import pytest
+import requests
 from neon_api import NeonAPI
 
 if TYPE_CHECKING:
@@ -299,6 +300,76 @@ def neon_branch_isolated(
             conn_string = neon_branch_isolated.connection_string
     """
     yield from _create_neon_branch(request)
+
+
+def _reset_branch_to_parent(api_key: str, project_id: str, branch_id: str) -> None:
+    """Reset a branch to its parent's state using the Neon API."""
+    url = f"https://console.neon.tech/api/v2/projects/{project_id}/branches/{branch_id}/restore"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    # Reset to parent branch
+    response = requests.post(url, headers=headers, json={"source_branch_id": "parent"})
+    response.raise_for_status()
+
+
+@pytest.fixture(scope="module")
+def _neon_branch_for_reset(
+    request: pytest.FixtureRequest,
+) -> Generator[NeonBranch, None, None]:
+    """Internal fixture that creates a branch for reset-based isolation."""
+    yield from _create_neon_branch(request)
+
+
+@pytest.fixture(scope="function")
+def neon_branch_reset(
+    request: pytest.FixtureRequest,
+    _neon_branch_for_reset: NeonBranch,
+) -> Generator[NeonBranch, None, None]:
+    """
+    Provide a Neon branch that resets to parent state after each test.
+
+    This fixture creates one branch per module (like `neon_branch`) but resets
+    it to the parent branch's state after each test completes. This provides
+    test isolation while being faster than creating a new branch per test.
+
+    Use this when:
+    - Tests modify database state and you need isolation
+    - You want faster test execution than `neon_branch_isolated`
+    - Your parent branch has the baseline schema/data you want to reset to
+
+    Note: Reset operation briefly interrupts connections. The branch is reset
+    AFTER each test, so the first test sees a fresh branch.
+
+    Yields:
+        NeonBranch: Object with branch_id, project_id, connection_string, and host.
+
+    Example:
+        def test_with_reset(neon_branch_reset):
+            # Make changes - they'll be reset after this test
+            conn_string = neon_branch_reset.connection_string
+    """
+    config = request.config
+    api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY")
+
+    yield _neon_branch_for_reset
+
+    # Reset branch to parent state after each test
+    if api_key:
+        try:
+            _reset_branch_to_parent(
+                api_key=api_key,
+                project_id=_neon_branch_for_reset.project_id,
+                branch_id=_neon_branch_for_reset.branch_id,
+            )
+        except Exception as e:
+            import warnings
+
+            warnings.warn(
+                f"Failed to reset branch {_neon_branch_for_reset.branch_id}: {e}",
+                stacklevel=2,
+            )
 
 
 @pytest.fixture
