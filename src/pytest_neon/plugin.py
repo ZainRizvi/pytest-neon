@@ -137,11 +137,20 @@ def _get_config_value(
 
 def _create_neon_branch(
     request: pytest.FixtureRequest,
+    parent_branch_id_override: str | None = None,
+    branch_expiry_override: int | None = None,
+    branch_name_suffix: str = "",
 ) -> Generator[NeonBranch, None, None]:
     """
     Internal helper that creates and manages a Neon branch lifecycle.
 
     This is the core implementation used by branch fixtures.
+
+    Args:
+        request: Pytest fixture request
+        parent_branch_id_override: If provided, use this as parent instead of config
+        branch_expiry_override: If provided, use this expiry instead of config
+        branch_name_suffix: Optional suffix for branch name (e.g., "-migrated", "-test")
     """
     config = request.config
 
@@ -149,7 +158,8 @@ def _create_neon_branch(
     project_id = _get_config_value(
         config, "neon_project_id", "NEON_PROJECT_ID", "neon_project_id"
     )
-    parent_branch_id = _get_config_value(
+    # Use override if provided, otherwise read from config
+    parent_branch_id = parent_branch_id_override or _get_config_value(
         config, "neon_parent_branch", "NEON_PARENT_BRANCH_ID", "neon_parent_branch"
     )
     database_name = _get_config_value(
@@ -164,9 +174,13 @@ def _create_neon_branch(
     if keep_branches is None:
         keep_branches = config.getini("neon_keep_branches")
 
-    branch_expiry = config.getoption("neon_branch_expiry", default=None)
-    if branch_expiry is None:
-        branch_expiry = int(config.getini("neon_branch_expiry"))
+    # Use override if provided, otherwise read from config
+    if branch_expiry_override is not None:
+        branch_expiry = branch_expiry_override
+    else:
+        branch_expiry = config.getoption("neon_branch_expiry", default=None)
+        if branch_expiry is None:
+            branch_expiry = int(config.getini("neon_branch_expiry"))
 
     env_var_name = _get_config_value(
         config, "neon_env_var", "", "neon_env_var", "DATABASE_URL"
@@ -185,7 +199,7 @@ def _create_neon_branch(
     neon = NeonAPI(api_key=api_key)
 
     # Generate unique branch name
-    branch_name = f"pytest-{os.urandom(4).hex()}"
+    branch_name = f"pytest-{os.urandom(4).hex()}{branch_name_suffix}"
 
     # Build branch creation payload
     branch_config: dict[str, Any] = {"name": branch_name}
@@ -311,12 +325,86 @@ def _reset_branch_to_parent(branch: NeonBranch, api_key: str) -> None:
     response.raise_for_status()
 
 
+@pytest.fixture(scope="session")
+def _neon_migration_branch(
+    request: pytest.FixtureRequest,
+) -> Generator[NeonBranch, None, None]:
+    """
+    Session-scoped branch where migrations are applied.
+
+    This branch is created from the configured parent and serves as
+    the parent for all test branches. Migrations run once per session
+    on this branch.
+
+    Note: The migration branch cannot have an expiry because Neon doesn't
+    allow creating child branches from branches with expiration dates.
+    Cleanup relies on the fixture teardown at session end.
+    """
+    # No expiry - Neon doesn't allow children from branches with expiry
+    yield from _create_neon_branch(
+        request,
+        branch_expiry_override=0,
+        branch_name_suffix="-migrated",
+    )
+
+
+@pytest.fixture(scope="session")
+def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> None:
+    """
+    Override this fixture to run migrations on the test database.
+
+    The migration branch is already created and DATABASE_URL is set.
+    Migrations run once per test session, before any tests execute.
+
+    Example in conftest.py:
+
+        @pytest.fixture(scope="session")
+        def neon_apply_migrations(_neon_migration_branch):
+            import subprocess
+            subprocess.run(["alembic", "upgrade", "head"], check=True)
+
+    Or with Django:
+
+        @pytest.fixture(scope="session")
+        def neon_apply_migrations(_neon_migration_branch):
+            from django.core.management import call_command
+            call_command("migrate", "--noinput")
+
+    Or with raw SQL:
+
+        @pytest.fixture(scope="session")
+        def neon_apply_migrations(_neon_migration_branch):
+            import psycopg
+            with psycopg.connect(_neon_migration_branch.connection_string) as conn:
+                with open("schema.sql") as f:
+                    conn.execute(f.read())
+                conn.commit()
+
+    Args:
+        _neon_migration_branch: The migration branch with connection details.
+            Use _neon_migration_branch.connection_string to connect directly,
+            or rely on DATABASE_URL which is already set.
+    """
+    pass  # No-op by default - users override this fixture to run migrations
+
+
 @pytest.fixture(scope="module")
 def _neon_branch_for_reset(
     request: pytest.FixtureRequest,
+    _neon_migration_branch: NeonBranch,
+    neon_apply_migrations: None,  # Ensures migrations run first
 ) -> Generator[NeonBranch, None, None]:
-    """Internal fixture that creates a branch for reset-based isolation."""
-    yield from _create_neon_branch(request)
+    """
+    Internal fixture that creates a test branch from the migration branch.
+
+    The test branch is created as a child of the migration branch, so resets
+    restore to post-migration state rather than the original parent state.
+    """
+    yield from _create_neon_branch(
+        request,
+        parent_branch_id_override=_neon_migration_branch.branch_id,
+        branch_name_suffix="-test",
+    )
 
 
 @pytest.fixture(scope="function")
@@ -383,6 +471,8 @@ def neon_branch(
 @pytest.fixture(scope="module")
 def neon_branch_shared(
     request: pytest.FixtureRequest,
+    _neon_migration_branch: NeonBranch,
+    neon_apply_migrations: None,  # Ensures migrations run first
 ) -> Generator[NeonBranch, None, None]:
     """
     Provide a shared Neon database branch for all tests in a module.
@@ -390,6 +480,9 @@ def neon_branch_shared(
     This fixture creates one branch per test module and shares it across all
     tests without resetting. This is the fastest option but tests can see
     each other's data modifications.
+
+    If you override the `neon_apply_migrations` fixture, migrations will run
+    once before the first test, and this branch will include the migrated schema.
 
     Use this when:
     - Tests are read-only or don't interfere with each other
@@ -408,7 +501,11 @@ def neon_branch_shared(
             # Fast: no reset between tests, but be careful about data leakage
             conn_string = neon_branch_shared.connection_string
     """
-    yield from _create_neon_branch(request)
+    yield from _create_neon_branch(
+        request,
+        parent_branch_id_override=_neon_migration_branch.branch_id,
+        branch_name_suffix="-shared",
+    )
 
 
 @pytest.fixture
