@@ -1,5 +1,9 @@
 # Claude Code Instructions for pytest-neon
 
+## Understanding the Plugin
+
+Read `README.md` for complete documentation on how to use this plugin, including fixtures, configuration options, and migration support.
+
 ## Project Overview
 
 This is a pytest plugin that provides isolated Neon database branches for integration testing. Each test gets isolated database state via branch reset after each test.
@@ -7,6 +11,8 @@ This is a pytest plugin that provides isolated Neon database branches for integr
 ## Key Architecture
 
 - **Entry point**: `src/pytest_neon/plugin.py` - Contains all fixtures and pytest hooks
+- **Migration fixture**: `_neon_migration_branch` - Session-scoped, parent for all test branches
+- **User migration hook**: `neon_apply_migrations` - Session-scoped no-op, users override to run migrations
 - **Core fixture**: `neon_branch` - Creates branch (module-scoped), resets after each test (function-scoped wrapper), sets `DATABASE_URL`, yields `NeonBranch` dataclass
 - **Shared fixture**: `neon_branch_shared` - Module-scoped, no reset between tests
 - **Convenience fixtures**: `neon_connection`, `neon_connection_psycopg`, `neon_engine` - Optional, require extras
@@ -19,7 +25,9 @@ This is a pytest plugin that provides isolated Neon database branches for integr
 ## Important Patterns
 
 ### Fixture Scopes
-- `_neon_branch_for_reset`: `scope="module"` - internal, creates one branch per test file
+- `_neon_migration_branch`: `scope="session"` - internal, parent for all test branches, migrations run here
+- `neon_apply_migrations`: `scope="session"` - user overrides to run migrations
+- `_neon_branch_for_reset`: `scope="module"` - internal, creates one branch per test file from migration branch
 - `neon_branch`: `scope="function"` - wraps the above, resets branch after each test
 - `neon_branch_shared`: `scope="module"` - one branch per test file, no reset
 - Connection fixtures: `scope="function"` (default) - fresh connection per test

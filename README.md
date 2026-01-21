@@ -158,6 +158,90 @@ def test_query(neon_engine):
         assert result.scalar() == 1
 ```
 
+## Migrations
+
+pytest-neon supports running migrations once before tests, with all test resets preserving the migrated state.
+
+### How It Works
+
+When you override the `neon_apply_migrations` fixture, the plugin uses a two-branch architecture:
+
+```
+Parent Branch (your configured parent)
+    └── Migration Branch (session-scoped)
+            │   ↑ migrations run here ONCE
+            └── Test Branch (module-scoped)
+                    ↑ resets to migration branch after each test
+```
+
+This means:
+- Migrations run **once per test session** (not per test or per module)
+- Each test reset restores to the **post-migration state**
+- Tests always see your migrated schema
+
+### Setup
+
+Override the `neon_apply_migrations` fixture in your `conftest.py`:
+
+**Alembic:**
+```python
+# conftest.py
+import subprocess
+import pytest
+
+@pytest.fixture(scope="session")
+def neon_apply_migrations(_neon_migration_branch):
+    """Run Alembic migrations before tests."""
+    # DATABASE_URL is already set to the migration branch
+    subprocess.run(["alembic", "upgrade", "head"], check=True)
+```
+
+**Django:**
+```python
+# conftest.py
+import pytest
+
+@pytest.fixture(scope="session")
+def neon_apply_migrations(_neon_migration_branch):
+    """Run Django migrations before tests."""
+    from django.core.management import call_command
+    call_command("migrate", "--noinput")
+```
+
+**Raw SQL:**
+```python
+# conftest.py
+import pytest
+
+@pytest.fixture(scope="session")
+def neon_apply_migrations(_neon_migration_branch):
+    """Apply schema from SQL file."""
+    import psycopg
+    with psycopg.connect(_neon_migration_branch.connection_string) as conn:
+        with open("schema.sql") as f:
+            conn.execute(f.read())
+        conn.commit()
+```
+
+**Custom migration tool:**
+```python
+# conftest.py
+import pytest
+
+@pytest.fixture(scope="session")
+def neon_apply_migrations(_neon_migration_branch):
+    """Run custom migrations."""
+    from myapp.migrations import run_migrations
+    run_migrations(_neon_migration_branch.connection_string)
+```
+
+### Important Notes
+
+- The `_neon_migration_branch` parameter gives you access to the `NeonBranch` object with `connection_string`, `branch_id`, etc.
+- `DATABASE_URL` (or your configured env var) is automatically set when the fixture runs
+- If you don't override `neon_apply_migrations`, no migrations run (the fixture is a no-op by default)
+- Migrations run before any test branches are created, so all tests see the same migrated schema
+
 ## Configuration
 
 ### Environment Variables

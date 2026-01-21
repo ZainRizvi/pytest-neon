@@ -81,6 +81,81 @@ class TestRealBranchCreation:
         assert os.environ.get("DATABASE_URL") == neon_branch.connection_string
 
 
+class TestMigrations:
+    """Test migration support with real Neon branches."""
+
+    def test_migrations_persist_across_resets(self, pytester, tmp_path):
+        """Test that migrations run once and persist across test resets."""
+        # Write a conftest that tracks migration and verifies table exists
+        conftest = f"""
+import os
+import pytest
+
+# Track if migrations ran
+migrations_ran = [False]
+
+@pytest.fixture(scope="session")
+def neon_apply_migrations(_neon_migration_branch):
+    \"\"\"Create a test table via migration.\"\"\"
+    try:
+        import psycopg
+    except ImportError:
+        pytest.skip("psycopg not installed")
+
+    with psycopg.connect(_neon_migration_branch.connection_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute(\"\"\"
+                CREATE TABLE IF NOT EXISTS migration_test (
+                    id SERIAL PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            \"\"\")
+        conn.commit()
+    migrations_ran[0] = True
+
+def pytest_sessionfinish(session, exitstatus):
+    assert migrations_ran[0], "Migrations should have run"
+"""
+        pytester.makeconftest(conftest)
+
+        # Write tests that verify the migrated table exists and data resets
+        pytester.makepyfile(
+            """
+import psycopg
+
+def test_first_insert(neon_branch):
+    \"\"\"Insert data - table should exist from migration.\"\"\"
+    with psycopg.connect(neon_branch.connection_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO migration_test (value) VALUES ('first')")
+        conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM migration_test")
+            count = cur.fetchone()[0]
+            assert count == 1
+
+def test_second_insert_after_reset(neon_branch):
+    \"\"\"After reset, table exists but previous data is gone.\"\"\"
+    with psycopg.connect(neon_branch.connection_string) as conn:
+        # Table should still exist (from migration)
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM migration_test")
+            count = cur.fetchone()[0]
+            # Data from first test should be gone after reset
+            assert count == 0
+
+        # Insert new data
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO migration_test (value) VALUES ('second')")
+        conn.commit()
+"""
+        )
+
+        result = pytester.runpytest("-v")
+        result.assert_outcomes(passed=2)
+
+
 class TestRealDatabaseConnectivity:
     """Test actual database connectivity."""
 
