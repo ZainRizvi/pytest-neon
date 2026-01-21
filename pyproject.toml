@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 keywords = ["pytest", "neon", "postgres", "testing", "database", "branching"]
-authors = [{ name = "Zain" }]
+authors = [{ name = "Zain Rizvi" }]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: Pytest",
@@ -30,6 +30,7 @@ classifiers = [
 dependencies = [
     "pytest>=7.0",
     "neon-api>=0.1.0",
+    "requests>=2.20",
 ]
 
 [project.optional-dependencies]

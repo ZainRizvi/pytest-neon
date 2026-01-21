@@ -91,6 +91,31 @@ def test_branch_info(neon_branch):
     conn = psycopg.connect(neon_branch.connection_string)
 ```
 
+### `neon_branch_isolated` (function-scoped)
+
+Creates a fresh branch for each individual test function, providing complete isolation between tests.
+
+```python
+def test_isolated_operation(neon_branch_isolated):
+    # Each test gets its own fresh branch
+    # Changes here won't affect other tests
+    conn = psycopg.connect(neon_branch_isolated.connection_string)
+```
+
+Use this when tests modify database state and you need guaranteed isolation. Note that creating a branch per test is slower than sharing a module-scoped branch.
+
+### `neon_branch_reset` (reset after each test)
+
+Creates one branch per module but resets it to the parent branch's state after each test. This provides test isolation while being faster than creating a new branch per test.
+
+```python
+def test_with_reset(neon_branch_reset):
+    # Make changes - they'll be reset after this test
+    conn = psycopg.connect(neon_branch_reset.connection_string)
+```
+
+Use this when you want isolation between tests but faster execution than `neon_branch_isolated`.
+
 ### `neon_connection_psycopg` (psycopg v3)
 
 Convenience fixture providing a [psycopg v3](https://www.psycopg.org/psycopg3/) connection with automatic rollback and cleanup.
