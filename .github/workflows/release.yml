@@ -26,20 +26,21 @@ jobs:
       - name: Check CI status
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           SHA=$(git rev-parse HEAD)
           echo "Checking CI status for commit: $SHA"
 
-          # Get the combined status for the commit
-          # This checks all status checks and check runs
-          STATE=$(gh api repos/${{ github.repository }}/commits/$SHA/status --jq '.state')
+          # Get check runs excluding this release workflow
+          FAILED=$(gh api "repos/$REPO/commits/$SHA/check-runs" \
+            --jq '[.check_runs[] | select(.name != "release") | select(.conclusion != "success" and .conclusion != "skipped")] | length')
 
-          if [ "$STATE" != "success" ]; then
-            echo "❌ CI checks have not passed on this commit (state: $STATE)"
+          if [ "$FAILED" != "0" ]; then
+            echo "❌ CI checks have not passed on this commit"
             echo ""
-            echo "Recent check runs:"
-            gh api repos/${{ github.repository }}/commits/$SHA/check-runs \
-              --jq '.check_runs[] | "  - \(.name): \(.conclusion // .status)"'
+            echo "Check runs:"
+            gh api "repos/$REPO/commits/$SHA/check-runs" \
+              --jq '.check_runs[] | select(.name != "release") | "  - \(.name): \(.conclusion // .status)"'
             exit 1
           fi
 
