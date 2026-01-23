@@ -206,3 +206,68 @@ class TestRealDatabaseConnectivity:
             )
             result = cur.fetchone()
             assert result[0] == "test_value"
+
+
+class TestSQLAlchemyPooledConnections:
+    """Test SQLAlchemy connection pooling behavior with branch resets.
+
+    Branch resets terminate server-side connections. SQLAlchemy's connection
+    pool doesn't know this, so pooled connections become stale.
+
+    Solution: Use pool_pre_ping=True (recommended for any cloud database).
+    This pings connections before use and discards stale ones automatically.
+    """
+
+    def test_pool_pre_ping_handles_stale_connections(self, pytester):
+        """
+        Verify that pool_pre_ping=True handles stale connections after reset.
+
+        Pattern:
+        1. database.py creates engine with pool_pre_ping=True at import time
+        2. test_one uses it, connection goes to pool
+        3. Branch resets after test_one (server terminates connection)
+        4. test_two gets pooled connection, pool_pre_ping detects it's dead,
+           automatically gets fresh connection
+        """
+        pytester.makepyfile(
+            database="""
+import os
+from sqlalchemy import create_engine
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+# pool_pre_ping=True is REQUIRED for pytest-neon (and recommended for any cloud DB)
+# It verifies connections are alive before using them
+engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
+"""
+        )
+
+        pytester.makepyfile(
+            test_sqlalchemy_reset="""
+from sqlalchemy import text
+
+def test_first_query(neon_branch):
+    '''First test - creates pooled connection.'''
+    from database import engine
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT 1"))
+        assert result.scalar() == 1
+    # Connection returned to pool
+
+def test_second_query_after_reset(neon_branch):
+    '''Second test - branch was reset, but pool_pre_ping handles it.'''
+    from database import engine
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT 2"))
+        assert result.scalar() == 2
+
+def test_third_query_after_another_reset(neon_branch):
+    '''Third test - still works thanks to pool_pre_ping.'''
+    from database import engine
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT 3"))
+        assert result.scalar() == 3
+"""
+        )
+
+        result = pytester.runpytest("-v")
+        result.assert_outcomes(passed=3)

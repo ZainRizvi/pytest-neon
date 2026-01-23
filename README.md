@@ -72,7 +72,7 @@ pytest
 
 ### `neon_branch` (default, recommended)
 
-The primary fixture for database testing. Creates one branch per test module, then resets it to the parent branch's state after each test. This provides test isolation with ~0.5s overhead per test.
+The primary fixture for database testing. Creates one branch per test session, then resets it to the parent branch's state after each test. This provides test isolation with ~0.5s overhead per test.
 
 Returns a `NeonBranch` dataclass with:
 
@@ -94,7 +94,7 @@ def test_branch_info(neon_branch):
     conn = psycopg.connect(neon_branch.connection_string)
 ```
 
-**Performance**: ~1.5s initial setup per module + ~0.5s reset per test. For a module with 10 tests, expect ~6.5s total overhead.
+**Performance**: ~1.5s initial setup per session + ~0.5s reset per test. For 10 tests, expect ~6.5s total overhead.
 
 ### `neon_branch_shared` (fastest, no isolation)
 
@@ -160,6 +160,24 @@ def test_query(neon_engine):
         assert result.scalar() == 1
 ```
 
+### Using Your Own SQLAlchemy Engine
+
+If you have a module-level SQLAlchemy engine (common pattern), you **must** use `pool_pre_ping=True`:
+
+```python
+# database.py
+from sqlalchemy import create_engine
+from config import DATABASE_URL
+
+# pool_pre_ping=True is REQUIRED for pytest-neon
+# It verifies connections are alive before using them
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+```
+
+**Why?** After each test, pytest-neon resets the branch which terminates server-side connections. Without `pool_pre_ping`, SQLAlchemy may try to reuse a dead pooled connection, causing `SSL connection has been closed unexpectedly` errors.
+
+This is also a best practice for any cloud database (Neon, RDS, etc.) where connections can be terminated externally.
+
 ## Migrations
 
 pytest-neon supports running migrations once before tests, with all test resets preserving the migrated state.
@@ -172,7 +190,7 @@ When you override the `neon_apply_migrations` fixture, the plugin uses a two-bra
 Parent Branch (your configured parent)
     └── Migration Branch (session-scoped)
             │   ↑ migrations run here ONCE
-            └── Test Branch (module-scoped)
+            └── Test Branch (session-scoped)
                     ↑ resets to migration branch after each test
 ```
 
@@ -336,11 +354,11 @@ jobs:
 
 ## How It Works
 
-1. Before each test module, the plugin creates a new Neon branch from your parent branch
+1. At the start of the test session, the plugin creates a new Neon branch from your parent branch
 2. `DATABASE_URL` is set to point to the new branch
 3. Tests run against this isolated branch with full access to your schema and data
 4. After each test, the branch is reset to its parent state (~0.5s)
-5. After all tests in the module complete, the branch is deleted
+5. After all tests complete, the branch is deleted
 6. As a safety net, branches auto-expire after 10 minutes even if cleanup fails
 
 Branches use copy-on-write storage, so you only pay for data that differs from the parent branch.
@@ -399,6 +417,18 @@ Set the `NEON_API_KEY` environment variable or use the `--neon-api-key` CLI opti
 ### "Neon project ID not configured"
 
 Set the `NEON_PROJECT_ID` environment variable or use the `--neon-project-id` CLI option.
+
+### "SSL connection has been closed unexpectedly" (SQLAlchemy)
+
+This happens when SQLAlchemy tries to reuse a pooled connection after a branch reset. The reset terminates server-side connections, but SQLAlchemy's pool doesn't know.
+
+**Fix:** Add `pool_pre_ping=True` to your engine:
+
+```python
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+```
+
+This makes SQLAlchemy verify connections before using them, automatically discarding stale ones.
 
 ## License
 
