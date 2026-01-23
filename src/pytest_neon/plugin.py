@@ -30,6 +30,7 @@ For full documentation, see: https://github.com/ZainRizvi/pytest-neon
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from collections.abc import Generator
@@ -69,16 +70,15 @@ def _get_schema_fingerprint(connection_string: str) -> tuple[tuple[Any, ...], ..
             # No driver available - can't fingerprint, assume migrations changed things
             return ()
 
-    with psycopg.connect(connection_string) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT table_name, column_name, data_type, is_nullable,
-                       column_default, ordinal_position
-                FROM information_schema.columns
-                WHERE table_schema = 'public'
-                ORDER BY table_name, ordinal_position
-            """)
-            rows = cur.fetchall()
+    with psycopg.connect(connection_string) as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT table_name, column_name, data_type, is_nullable,
+                   column_default, ordinal_position
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            ORDER BY table_name, ordinal_position
+        """)
+        rows = cur.fetchall()
     return tuple(tuple(row) for row in rows)
 
 
@@ -426,10 +426,8 @@ def _neon_migration_branch(
         yield branch
     finally:
         # Clean up by exhausting the generator (triggers branch deletion)
-        try:
+        with contextlib.suppress(StopIteration):
             next(branch_gen)
-        except StopIteration:
-            pass
 
 
 @pytest.fixture(scope="session")
@@ -486,7 +484,7 @@ def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> Any:
 def _neon_branch_for_reset(
     request: pytest.FixtureRequest,
     _neon_migration_branch: NeonBranch,
-    neon_apply_migrations: Any,  # Ensures migrations run first; value used for detection
+    neon_apply_migrations: Any,  # Ensures migrations run first; value for detection
 ) -> Generator[NeonBranch, None, None]:
     """
     Internal fixture that creates a test branch from the migration branch.
@@ -518,7 +516,8 @@ def _neon_branch_for_reset(
 
     if migrations_defined and pre_fingerprint:
         # Compare with current schema
-        post_fingerprint = _get_schema_fingerprint(_neon_migration_branch.connection_string)
+        conn_str = _neon_migration_branch.connection_string
+        post_fingerprint = _get_schema_fingerprint(conn_str)
         schema_changed = pre_fingerprint != post_fingerprint
     elif migrations_defined and not pre_fingerprint:
         # No fingerprint available (no psycopg/psycopg2 installed)

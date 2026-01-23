@@ -1,8 +1,8 @@
 """Tests for migration support."""
 
-import pytest
+import inspect
 
-from pytest_neon.plugin import _MIGRATIONS_NOT_DEFINED
+from pytest_neon.plugin import _MIGRATIONS_NOT_DEFINED, neon_apply_migrations
 
 
 class TestSmartMigrationDetection:
@@ -10,9 +10,6 @@ class TestSmartMigrationDetection:
 
     def test_sentinel_returned_when_migrations_not_overridden(self):
         """Default neon_apply_migrations returns sentinel to signal no override."""
-        from pytest_neon.plugin import neon_apply_migrations
-        import inspect
-
         # Get the default implementation's return behavior from source
         source = inspect.getsource(neon_apply_migrations)
         assert "_MIGRATIONS_NOT_DEFINED" in source
@@ -61,7 +58,8 @@ class TestSmartMigrationDetection:
             @pytest.fixture(scope="session")
             def _neon_branch_for_reset(_neon_migration_branch, neon_apply_migrations):
                 # Verify the detection logic
-                migrations_defined = neon_apply_migrations is not _MIGRATIONS_NOT_DEFINED
+                sentinel = _MIGRATIONS_NOT_DEFINED
+                migrations_defined = neon_apply_migrations is not sentinel
                 assert migrations_defined, "User override should NOT return sentinel"
                 yield _neon_migration_branch
 
