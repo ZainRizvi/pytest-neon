@@ -45,6 +45,42 @@ from neon_api.schema import EndpointState
 # Default branch expiry in seconds (10 minutes)
 DEFAULT_BRANCH_EXPIRY_SECONDS = 600
 
+# Sentinel value to detect when neon_apply_migrations was not overridden
+_MIGRATIONS_NOT_DEFINED = object()
+
+
+def _get_schema_fingerprint(connection_string: str) -> tuple[tuple[Any, ...], ...]:
+    """
+    Get a fingerprint of the database schema for change detection.
+
+    Queries information_schema for all tables, columns, and their properties
+    in the public schema. Returns a hashable tuple that can be compared
+    before/after migrations to detect if the schema actually changed.
+
+    This is used to avoid creating unnecessary migration branches when
+    no actual schema changes occurred.
+    """
+    try:
+        import psycopg
+    except ImportError:
+        try:
+            import psycopg2 as psycopg  # type: ignore[import-not-found]
+        except ImportError:
+            # No driver available - can't fingerprint, assume migrations changed things
+            return ()
+
+    with psycopg.connect(connection_string) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name, column_name, data_type, is_nullable,
+                       column_default, ordinal_position
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                ORDER BY table_name, ordinal_position
+            """)
+            rows = cur.fetchall()
+    return tuple(tuple(row) for row in rows)
+
 
 @dataclass
 class NeonBranch:
@@ -367,22 +403,48 @@ def _neon_migration_branch(
     Note: The migration branch cannot have an expiry because Neon doesn't
     allow creating child branches from branches with expiration dates.
     Cleanup relies on the fixture teardown at session end.
+
+    Smart Migration Detection:
+        Before yielding, this fixture captures a schema fingerprint and stores
+        it on request.config. After migrations run, _neon_branch_for_reset
+        compares the fingerprint to detect if the schema actually changed.
     """
     # No expiry - Neon doesn't allow children from branches with expiry
-    yield from _create_neon_branch(
+    branch_gen = _create_neon_branch(
         request,
         branch_expiry_override=0,
         branch_name_suffix="-migrated",
     )
+    branch = next(branch_gen)
+
+    # Capture schema fingerprint BEFORE migrations run
+    # This is stored on config so _neon_branch_for_reset can compare after
+    pre_migration_fingerprint = _get_schema_fingerprint(branch.connection_string)
+    request.config._neon_pre_migration_fingerprint = pre_migration_fingerprint  # type: ignore[attr-defined]
+
+    try:
+        yield branch
+    finally:
+        # Clean up by exhausting the generator (triggers branch deletion)
+        try:
+            next(branch_gen)
+        except StopIteration:
+            pass
 
 
 @pytest.fixture(scope="session")
-def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> None:
+def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> Any:
     """
     Override this fixture to run migrations on the test database.
 
     The migration branch is already created and DATABASE_URL is set.
     Migrations run once per test session, before any tests execute.
+
+    Smart Migration Detection:
+        The plugin automatically detects whether migrations actually modified
+        the database schema. If no schema changes occurred (or this fixture
+        isn't overridden), the plugin skips creating a separate migration
+        branch, saving Neon costs and branch slots.
 
     Example in conftest.py:
 
@@ -412,15 +474,19 @@ def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> None:
         _neon_migration_branch: The migration branch with connection details.
             Use _neon_migration_branch.connection_string to connect directly,
             or rely on DATABASE_URL which is already set.
+
+    Returns:
+        Any value (ignored). The default returns a sentinel to indicate
+        the fixture was not overridden.
     """
-    pass  # No-op by default - users override this fixture to run migrations
+    return _MIGRATIONS_NOT_DEFINED
 
 
 @pytest.fixture(scope="session")
 def _neon_branch_for_reset(
     request: pytest.FixtureRequest,
     _neon_migration_branch: NeonBranch,
-    neon_apply_migrations: None,  # Ensures migrations run first
+    neon_apply_migrations: Any,  # Ensures migrations run first; value used for detection
 ) -> Generator[NeonBranch, None, None]:
     """
     Internal fixture that creates a test branch from the migration branch.
@@ -429,14 +495,47 @@ def _neon_branch_for_reset(
     session, avoiding issues with Python's module caching (e.g., SQLAlchemy
     engines created at import time would otherwise point to stale branches).
 
-    The test branch is created as a child of the migration branch, so resets
-    restore to post-migration state rather than the original parent state.
+    Smart Migration Detection:
+        This fixture implements a cost-optimization strategy:
+
+        1. If neon_apply_migrations was not overridden (returns sentinel),
+           skip creating a separate test branch - use the migration branch directly.
+
+        2. If neon_apply_migrations was overridden, compare schema fingerprints
+           before/after migrations. Only create a child branch if the schema
+           actually changed.
+
+        This avoids unnecessary Neon costs and branch slots when:
+        - No migration fixture is defined
+        - Migrations exist but are already applied (no schema changes)
     """
-    yield from _create_neon_branch(
-        request,
-        parent_branch_id_override=_neon_migration_branch.branch_id,
-        branch_name_suffix="-test",
-    )
+    # Check if migrations fixture was overridden
+    migrations_defined = neon_apply_migrations is not _MIGRATIONS_NOT_DEFINED
+
+    # Check if schema actually changed (if we have a pre-migration fingerprint)
+    pre_fingerprint = getattr(request.config, "_neon_pre_migration_fingerprint", ())
+    schema_changed = False
+
+    if migrations_defined and pre_fingerprint:
+        # Compare with current schema
+        post_fingerprint = _get_schema_fingerprint(_neon_migration_branch.connection_string)
+        schema_changed = pre_fingerprint != post_fingerprint
+    elif migrations_defined and not pre_fingerprint:
+        # No fingerprint available (no psycopg/psycopg2 installed)
+        # Assume migrations changed something to be safe
+        schema_changed = True
+
+    # Only create a child branch if migrations actually modified the schema
+    if schema_changed:
+        yield from _create_neon_branch(
+            request,
+            parent_branch_id_override=_neon_migration_branch.branch_id,
+            branch_name_suffix="-test",
+        )
+    else:
+        # No schema changes - reuse the migration branch directly
+        # This saves creating an unnecessary branch
+        yield _neon_migration_branch
 
 
 @pytest.fixture(scope="function")

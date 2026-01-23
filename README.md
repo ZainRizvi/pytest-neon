@@ -182,9 +182,26 @@ This is also a best practice for any cloud database (Neon, RDS, etc.) where conn
 
 pytest-neon supports running migrations once before tests, with all test resets preserving the migrated state.
 
+### Smart Migration Detection
+
+The plugin automatically detects whether migrations actually modified the database schema. This optimization:
+
+- **Saves Neon costs**: No extra branch created when migrations don't change anything
+- **Saves branch slots**: Neon projects have branch limits; this avoids wasting them
+- **Zero configuration**: Works automatically with any migration tool
+
+**When a second branch is created:**
+- Only when `neon_apply_migrations` is overridden AND the schema actually changes
+
+**When only one branch is used:**
+- If you don't override `neon_apply_migrations` (no migrations defined)
+- If your migrations are already applied (schema unchanged)
+
+The detection works by comparing a fingerprint of `information_schema.columns` before and after migrations run.
+
 ### How It Works
 
-When you override the `neon_apply_migrations` fixture, the plugin uses a two-branch architecture:
+When migrations actually modify the schema, the plugin uses a two-branch architecture:
 
 ```
 Parent Branch (your configured parent)
@@ -192,6 +209,14 @@ Parent Branch (your configured parent)
             │   ↑ migrations run here ONCE
             └── Test Branch (session-scoped)
                     ↑ resets to migration branch after each test
+```
+
+When no schema changes occur, the plugin uses a single-branch architecture:
+
+```
+Parent Branch (your configured parent)
+    └── Migration/Test Branch (session-scoped)
+            ↑ resets to parent after each test
 ```
 
 This means:

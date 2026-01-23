@@ -35,6 +35,21 @@ This is a pytest plugin that provides isolated Neon database branches for integr
 ### Environment Variable Handling
 The `_create_neon_branch` function sets `DATABASE_URL` (or configured env var) during the fixture lifecycle and restores the original value in the finally block. This is critical for not polluting other tests.
 
+### Smart Migration Detection (Cost Optimization)
+The plugin avoids creating unnecessary branches through a two-layer detection strategy:
+
+1. **Sentinel detection**: If `neon_apply_migrations` is not overridden, it returns `_MIGRATIONS_NOT_DEFINED` sentinel. No child branch is created.
+
+2. **Schema fingerprint comparison**: If migrations are defined, the plugin captures `information_schema.columns` before migrations run and compares after. Only creates a child branch if the schema actually changed.
+
+**Design philosophy**: Users who define a migration fixture but rarely have actual pending migrations shouldn't pay for an extra branch every test run. The schema fingerprint approach detects actual changes, not just "migration code ran."
+
+**Implementation notes**:
+- Pre-migration fingerprint is captured in `_neon_migration_branch` and stored on `request.config`
+- Post-migration comparison happens in `_neon_branch_for_reset`
+- Falls back to assuming changes if no psycopg/psycopg2 is available for fingerprinting
+- Only checks schema (tables, columns), not data - this is intentional since seeding is not the use case
+
 ### Error Messages
 Convenience fixtures use `pytest.fail()` with detailed, formatted error messages when dependencies are missing. Keep this pattern - users need clear guidance on how to fix import errors.
 
@@ -51,6 +66,11 @@ The module docstring in `plugin.py` should include key usage notes (like the SQL
 - Keep commits clean and descriptive
 
 ## Testing
+
+Run tests with:
+```bash
+uv run pytest tests/ -v
+```
 
 Tests in `tests/` use `pytester` for testing pytest plugins. The plugin itself can be tested without a real Neon connection by mocking `NeonAPI`.
 
