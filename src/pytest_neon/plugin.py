@@ -1,4 +1,32 @@
-"""Pytest plugin providing Neon database branch fixtures."""
+"""Pytest plugin providing Neon database branch fixtures.
+
+This plugin provides fixtures for isolated database testing using Neon's
+instant branching feature. Each test gets a clean database state via
+branch reset after each test.
+
+Main fixtures:
+    neon_branch: Primary fixture - one branch per session, reset after each test
+    neon_branch_shared: Shared branch without reset (fastest, no isolation)
+    neon_connection: psycopg2 connection (requires psycopg2 extra)
+    neon_connection_psycopg: psycopg v3 connection (requires psycopg extra)
+    neon_engine: SQLAlchemy engine (requires sqlalchemy extra)
+
+SQLAlchemy Users:
+    If you create your own SQLAlchemy engine (not using neon_engine fixture),
+    you MUST use pool_pre_ping=True:
+
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+    This is required because branch resets terminate server-side connections.
+    Without pool_pre_ping, SQLAlchemy may try to reuse dead pooled connections,
+    causing "SSL connection has been closed unexpectedly" errors.
+
+Configuration:
+    Set NEON_API_KEY and NEON_PROJECT_ID environment variables, or use
+    --neon-api-key and --neon-project-id CLI options.
+
+For full documentation, see: https://github.com/ZainRizvi/pytest-neon
+"""
 
 from __future__ import annotations
 
@@ -388,7 +416,7 @@ def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> None:
     pass  # No-op by default - users override this fixture to run migrations
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def _neon_branch_for_reset(
     request: pytest.FixtureRequest,
     _neon_migration_branch: NeonBranch,
@@ -396,6 +424,10 @@ def _neon_branch_for_reset(
 ) -> Generator[NeonBranch, None, None]:
     """
     Internal fixture that creates a test branch from the migration branch.
+
+    This is session-scoped so DATABASE_URL remains stable throughout the test
+    session, avoiding issues with Python's module caching (e.g., SQLAlchemy
+    engines created at import time would otherwise point to stale branches).
 
     The test branch is created as a child of the migration branch, so resets
     restore to post-migration state rather than the original parent state.
@@ -416,25 +448,35 @@ def neon_branch(
     Provide an isolated Neon database branch for each test.
 
     This is the primary fixture for database testing. It creates one branch per
-    test module, then resets it to the parent branch's state after each test.
+    test session, then resets it to the parent branch's state after each test.
     This provides test isolation with ~0.5s overhead per test.
 
-    The branch is automatically deleted after all tests in the module complete,
-    unless --neon-keep-branches is specified. Branches also auto-expire after
+    The branch is automatically deleted after all tests complete, unless
+    --neon-keep-branches is specified. Branches also auto-expire after
     10 minutes by default (configurable via --neon-branch-expiry) as a safety net
     for interrupted test runs.
 
     The connection string is automatically set in the DATABASE_URL environment
     variable (configurable via --neon-env-var).
 
+    SQLAlchemy Users:
+        If you create your own engine (not using the neon_engine fixture),
+        you MUST use pool_pre_ping=True::
+
+            engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+        Branch resets terminate server-side connections. Without pool_pre_ping,
+        SQLAlchemy may reuse dead pooled connections, causing SSL errors.
+
     Requires either:
-    - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
-    - --neon-api-key and --neon-project-id command line options
+        - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
+        - --neon-api-key and --neon-project-id command line options
 
     Yields:
         NeonBranch: Object with branch_id, project_id, connection_string, and host.
 
-    Example:
+    Example::
+
         def test_database_operation(neon_branch):
             # DATABASE_URL is automatically set
             conn_string = os.environ["DATABASE_URL"]
@@ -602,12 +644,24 @@ def neon_engine(neon_branch: NeonBranch):
     Requires the sqlalchemy optional dependency:
         pip install pytest-neon[sqlalchemy]
 
-    The engine is disposed after each test.
+    The engine is disposed after each test, which handles stale connections
+    after branch resets automatically.
+
+    Note:
+        If you create your own module-level engine instead of using this
+        fixture, you MUST use pool_pre_ping=True::
+
+            engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+        This is required because branch resets terminate server-side
+        connections, and without pool_pre_ping SQLAlchemy may reuse dead
+        pooled connections.
 
     Yields:
         SQLAlchemy Engine object
 
-    Example:
+    Example::
+
         def test_query(neon_engine):
             with neon_engine.connect() as conn:
                 result = conn.execute(text("SELECT 1"))

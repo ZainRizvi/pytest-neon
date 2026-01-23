@@ -13,7 +13,7 @@ This is a pytest plugin that provides isolated Neon database branches for integr
 - **Entry point**: `src/pytest_neon/plugin.py` - Contains all fixtures and pytest hooks
 - **Migration fixture**: `_neon_migration_branch` - Session-scoped, parent for all test branches
 - **User migration hook**: `neon_apply_migrations` - Session-scoped no-op, users override to run migrations
-- **Core fixture**: `neon_branch` - Creates branch (module-scoped), resets after each test (function-scoped wrapper), sets `DATABASE_URL`, yields `NeonBranch` dataclass
+- **Core fixture**: `neon_branch` - Creates branch (session-scoped), resets after each test (function-scoped wrapper), sets `DATABASE_URL`, yields `NeonBranch` dataclass
 - **Shared fixture**: `neon_branch_shared` - Module-scoped, no reset between tests
 - **Convenience fixtures**: `neon_connection`, `neon_connection_psycopg`, `neon_engine` - Optional, require extras
 
@@ -27,7 +27,7 @@ This is a pytest plugin that provides isolated Neon database branches for integr
 ### Fixture Scopes
 - `_neon_migration_branch`: `scope="session"` - internal, parent for all test branches, migrations run here
 - `neon_apply_migrations`: `scope="session"` - user overrides to run migrations
-- `_neon_branch_for_reset`: `scope="module"` - internal, creates one branch per test file from migration branch
+- `_neon_branch_for_reset`: `scope="session"` - internal, creates one branch per session from migration branch
 - `neon_branch`: `scope="function"` - wraps the above, resets branch after each test
 - `neon_branch_shared`: `scope="module"` - one branch per test file, no reset
 - Connection fixtures: `scope="function"` (default) - fresh connection per test
@@ -37,6 +37,14 @@ The `_create_neon_branch` function sets `DATABASE_URL` (or configured env var) d
 
 ### Error Messages
 Convenience fixtures use `pytest.fail()` with detailed, formatted error messages when dependencies are missing. Keep this pattern - users need clear guidance on how to fix import errors.
+
+## Documentation
+
+Important help text should be documented in BOTH:
+1. **README.md** - Full user-facing documentation
+2. **Module/fixture docstrings** - So `help(pytest_neon)` shows useful info
+
+The module docstring in `plugin.py` should include key usage notes (like the SQLAlchemy `pool_pre_ping=True` requirement). Keep docstrings and README in sync.
 
 ## Commit Messages
 - Do NOT add Claude attribution or Co-Authored-By lines
