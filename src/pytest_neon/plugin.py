@@ -56,6 +56,17 @@ DEFAULT_BRANCH_EXPIRY_SECONDS = 600
 _MIGRATIONS_NOT_DEFINED = object()
 
 
+def _get_xdist_worker_id() -> str:
+    """
+    Get the pytest-xdist worker ID, or "main" if not running under xdist.
+
+    When running tests in parallel with pytest-xdist, each worker process
+    gets a unique ID (gw0, gw1, gw2, etc.). This is used to create separate
+    branches per worker to avoid database state pollution between parallel tests.
+    """
+    return os.environ.get("PYTEST_XDIST_WORKER", "main")
+
+
 def _get_schema_fingerprint(connection_string: str) -> tuple[tuple[Any, ...], ...]:
     """
     Get a fingerprint of the database schema for change detection.
@@ -527,6 +538,12 @@ def _neon_branch_for_reset(
     session, avoiding issues with Python's module caching (e.g., SQLAlchemy
     engines created at import time would otherwise point to stale branches).
 
+    Parallel Test Support (pytest-xdist):
+        When running tests in parallel with pytest-xdist, each worker gets its
+        own branch. This prevents database state pollution between tests running
+        concurrently on different workers. The worker ID is included in the
+        branch name suffix (e.g., "-test-gw0", "-test-gw1").
+
     Smart Migration Detection:
         This fixture implements a cost-optimization strategy:
 
@@ -558,15 +575,21 @@ def _neon_branch_for_reset(
         # Assume migrations changed something to be safe
         schema_changed = True
 
+    # Get worker ID for parallel test support
+    # Each xdist worker gets its own branch to avoid state pollution
+    worker_id = _get_xdist_worker_id()
+    branch_suffix = f"-test-{worker_id}"
+
     # Only create a child branch if migrations actually modified the schema
-    if schema_changed:
+    # OR if we're running under xdist (each worker needs its own branch)
+    if schema_changed or worker_id != "main":
         yield from _create_neon_branch(
             request,
             parent_branch_id_override=_neon_migration_branch.branch_id,
-            branch_name_suffix="-test",
+            branch_name_suffix=branch_suffix,
         )
     else:
-        # No schema changes - reuse the migration branch directly
+        # No schema changes and not parallel - reuse the migration branch directly
         # This saves creating an unnecessary branch
         yield _neon_migration_branch
 
