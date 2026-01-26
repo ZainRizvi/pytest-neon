@@ -52,7 +52,7 @@ export NEON_PROJECT_ID="your-project-id"
 2. Write tests:
 
 ```python
-def test_user_creation(neon_branch):
+def test_user_creation(neon_branch_readwrite):
     # DATABASE_URL is automatically set to the test branch
     import psycopg  # Your own install
 
@@ -60,6 +60,7 @@ def test_user_creation(neon_branch):
         with conn.cursor() as cur:
             cur.execute("INSERT INTO users (email) VALUES ('test@example.com')")
         conn.commit()
+    # Branch automatically resets after test - next test sees clean state
 ```
 
 3. Run tests:
@@ -70,9 +71,9 @@ pytest
 
 ## Fixtures
 
-### `neon_branch` (default, recommended)
+### `neon_branch_readwrite` (recommended for write tests)
 
-The primary fixture for database testing. Creates one branch per test session, then resets it to the parent branch's state after each test. This provides test isolation with ~0.5s overhead per test.
+The recommended fixture for tests that modify database state (INSERT, UPDATE, DELETE). Creates one branch per test session, then resets it to the parent branch's state after each test. This provides test isolation with ~0.5s overhead per test.
 
 Returns a `NeonBranch` dataclass with:
 
@@ -85,18 +86,53 @@ Returns a `NeonBranch` dataclass with:
 ```python
 import os
 
-def test_branch_info(neon_branch):
+def test_insert_user(neon_branch_readwrite):
     # DATABASE_URL is set automatically
-    assert os.environ["DATABASE_URL"] == neon_branch.connection_string
+    assert os.environ["DATABASE_URL"] == neon_branch_readwrite.connection_string
 
     # Use with any driver
     import psycopg
-    conn = psycopg.connect(neon_branch.connection_string)
+    with psycopg.connect(neon_branch_readwrite.connection_string) as conn:
+        conn.execute("INSERT INTO users (name) VALUES ('test')")
+        conn.commit()
+    # Branch resets after this test - changes won't affect other tests
 ```
 
 **Performance**: ~1.5s initial setup per session + ~0.5s reset per test. For 10 tests, expect ~6.5s total overhead.
 
-### `neon_branch_shared` (fastest, no isolation)
+### `neon_branch_readonly` (recommended for read-only tests)
+
+The recommended fixture for tests that only read data (SELECT queries). No branch reset occurs after each test, making it faster than `neon_branch_readwrite` (~0.5s saved per test).
+
+```python
+def test_query_users(neon_branch_readonly):
+    # DATABASE_URL is set automatically
+    import psycopg
+    with psycopg.connect(neon_branch_readonly.connection_string) as conn:
+        result = conn.execute("SELECT * FROM users").fetchall()
+        assert len(result) >= 0
+    # No reset after this test - fast!
+```
+
+**Use this when**:
+- Tests only perform SELECT queries
+- Tests don't modify database state
+- You want maximum performance for read-only tests
+
+**Warning**: If you accidentally write data using this fixture, subsequent tests will see those modifications. The fixture does not enforce read-only access at the database level.
+
+**Performance**: ~1.5s initial setup per session, no per-test overhead.
+
+### `neon_branch` (deprecated)
+
+> **Deprecated**: Use `neon_branch_readwrite` or `neon_branch_readonly` instead.
+
+This fixture is an alias for `neon_branch_readwrite` and will emit a deprecation warning. Migrate to the explicit fixture names for clarity:
+
+- `neon_branch_readwrite`: For tests that modify data (INSERT/UPDATE/DELETE)
+- `neon_branch_readonly`: For tests that only read data (SELECT)
+
+### `neon_branch_shared` (module-scoped, no isolation)
 
 Creates one branch per test module and shares it across all tests without resetting. This is the fastest option but tests can see each other's data modifications.
 
@@ -162,19 +198,21 @@ def test_query(neon_engine):
 
 ### Using Your Own SQLAlchemy Engine
 
-If you have a module-level SQLAlchemy engine (common pattern), you **must** use `pool_pre_ping=True`:
+If you have a module-level SQLAlchemy engine (common pattern) and use `neon_branch_readwrite`, you **must** use `pool_pre_ping=True`:
 
 ```python
 # database.py
 from sqlalchemy import create_engine
 from config import DATABASE_URL
 
-# pool_pre_ping=True is REQUIRED for pytest-neon
+# pool_pre_ping=True is REQUIRED when using neon_branch_readwrite
 # It verifies connections are alive before using them
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 ```
 
-**Why?** After each test, pytest-neon resets the branch which terminates server-side connections. Without `pool_pre_ping`, SQLAlchemy may try to reuse a dead pooled connection, causing `SSL connection has been closed unexpectedly` errors.
+**Why?** After each test, `neon_branch_readwrite` resets the branch which terminates server-side connections. Without `pool_pre_ping`, SQLAlchemy may try to reuse a dead pooled connection, causing `SSL connection has been closed unexpectedly` errors.
+
+**Note**: If you only use `neon_branch_readonly`, `pool_pre_ping` is not required since no resets occur.
 
 This is also a best practice for any cloud database (Neon, RDS, etc.) where connections can be terminated externally.
 
@@ -390,7 +428,7 @@ Branches use copy-on-write storage, so you only pay for data that differs from t
 
 ### What Reset Does
 
-The `neon_branch` fixture uses Neon's branch restore API to reset database state after each test:
+The `neon_branch_readwrite` fixture uses Neon's branch restore API to reset database state after each test:
 
 - **Data changes are reverted**: All INSERT, UPDATE, DELETE operations are undone
 - **Schema changes are reverted**: CREATE TABLE, ALTER TABLE, DROP TABLE, etc. are undone
@@ -427,12 +465,12 @@ pip install pytest-neon[psycopg2]
 pip install pytest-neon[sqlalchemy]
 ```
 
-Or use the core `neon_branch` fixture with your own driver:
+Or use the core fixtures with your own driver:
 
 ```python
-def test_example(neon_branch):
+def test_example(neon_branch_readwrite):
     import my_preferred_driver
-    conn = my_preferred_driver.connect(neon_branch.connection_string)
+    conn = my_preferred_driver.connect(neon_branch_readwrite.connection_string)
 ```
 
 ### "Neon API key not configured"

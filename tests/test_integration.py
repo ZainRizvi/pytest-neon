@@ -69,16 +69,22 @@ pytestmark = pytest.mark.skipif(
 class TestRealBranchCreation:
     """Test actual branch creation against Neon API."""
 
-    def test_branch_is_created_and_accessible(self, neon_branch):
+    def test_branch_is_created_and_accessible(self, neon_branch_readwrite):
         """Test that a real branch is created and has valid connection info."""
-        assert neon_branch.branch_id.startswith("br-")
-        assert neon_branch.project_id == PROJECT_ID
-        assert "neon.tech" in neon_branch.host
-        assert neon_branch.connection_string.startswith("postgresql://")
+        assert neon_branch_readwrite.branch_id.startswith("br-")
+        assert neon_branch_readwrite.project_id == PROJECT_ID
+        assert "neon.tech" in neon_branch_readwrite.host
+        assert neon_branch_readwrite.connection_string.startswith("postgresql://")
 
-    def test_database_url_is_set(self, neon_branch):
+    def test_database_url_is_set(self, neon_branch_readwrite):
         """Test that DATABASE_URL environment variable is set."""
-        assert os.environ.get("DATABASE_URL") == neon_branch.connection_string
+        assert os.environ.get("DATABASE_URL") == neon_branch_readwrite.connection_string
+
+    def test_readonly_fixture_works(self, neon_branch_readonly):
+        """Test that readonly fixture provides valid connection info."""
+        assert neon_branch_readonly.branch_id.startswith("br-")
+        assert neon_branch_readonly.project_id == PROJECT_ID
+        assert neon_branch_readonly.connection_string.startswith("postgresql://")
 
 
 class TestMigrations:
@@ -159,7 +165,7 @@ def test_second_insert_after_reset(neon_branch):
 class TestRealDatabaseConnectivity:
     """Test actual database connectivity."""
 
-    def test_can_connect_and_query(self, neon_branch):
+    def test_can_connect_and_query(self, neon_branch_readwrite):
         """Test that we can actually connect to the created branch."""
         try:
             import psycopg
@@ -167,14 +173,14 @@ class TestRealDatabaseConnectivity:
             pytest.skip("psycopg not installed - run: pip install pytest-neon[psycopg]")
 
         with (
-            psycopg.connect(neon_branch.connection_string) as conn,
+            psycopg.connect(neon_branch_readwrite.connection_string) as conn,
             conn.cursor() as cur,
         ):
             cur.execute("SELECT 1 AS result")
             result = cur.fetchone()
             assert result[0] == 1
 
-    def test_can_create_and_query_table(self, neon_branch):
+    def test_can_create_and_query_table(self, neon_branch_readwrite):
         """Test that we can create tables and insert data."""
         try:
             import psycopg
@@ -182,7 +188,7 @@ class TestRealDatabaseConnectivity:
             pytest.skip("psycopg not installed - run: pip install pytest-neon[psycopg]")
 
         with (
-            psycopg.connect(neon_branch.connection_string) as conn,
+            psycopg.connect(neon_branch_readwrite.connection_string) as conn,
             conn.cursor() as cur,
         ):
             # Create a test table
@@ -206,6 +212,21 @@ class TestRealDatabaseConnectivity:
             )
             result = cur.fetchone()
             assert result[0] == "test_value"
+
+    def test_readonly_can_query(self, neon_branch_readonly):
+        """Test that readonly fixture can execute queries."""
+        try:
+            import psycopg
+        except ImportError:
+            pytest.skip("psycopg not installed - run: pip install pytest-neon[psycopg]")
+
+        with (
+            psycopg.connect(neon_branch_readonly.connection_string) as conn,
+            conn.cursor() as cur,
+        ):
+            cur.execute("SELECT 1 AS result")
+            result = cur.fetchone()
+            assert result[0] == 1
 
 
 class TestSQLAlchemyPooledConnections:
@@ -245,7 +266,7 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else No
             test_sqlalchemy_reset="""
 from sqlalchemy import text
 
-def test_first_query(neon_branch):
+def test_first_query(neon_branch_readwrite):
     '''First test - creates pooled connection.'''
     from database import engine
     with engine.connect() as conn:
@@ -253,14 +274,14 @@ def test_first_query(neon_branch):
         assert result.scalar() == 1
     # Connection returned to pool
 
-def test_second_query_after_reset(neon_branch):
+def test_second_query_after_reset(neon_branch_readwrite):
     '''Second test - branch was reset, but pool_pre_ping handles it.'''
     from database import engine
     with engine.connect() as conn:
         result = conn.execute(text("SELECT 2"))
         assert result.scalar() == 2
 
-def test_third_query_after_another_reset(neon_branch):
+def test_third_query_after_another_reset(neon_branch_readwrite):
     '''Third test - still works thanks to pool_pre_ping.'''
     from database import engine
     with engine.connect() as conn:
