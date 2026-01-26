@@ -37,23 +37,191 @@ from __future__ import annotations
 
 import contextlib
 import os
+import random
 import time
 import warnings
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, TypeVar
 
 import pytest
 import requests
 from neon_api import NeonAPI
+from neon_api.exceptions import NeonAPIError
 from neon_api.schema import EndpointState
+
+T = TypeVar("T")
 
 # Default branch expiry in seconds (10 minutes)
 DEFAULT_BRANCH_EXPIRY_SECONDS = 600
 
+# Rate limit retry configuration
+# See: https://api-docs.neon.tech/reference/api-rate-limiting
+# Neon limits: 700 requests/minute (~11/sec), burst up to 40/sec per route
+_RATE_LIMIT_BASE_DELAY = 4.0  # seconds
+_RATE_LIMIT_MAX_TOTAL_DELAY = 90.0  # 1.5 minutes total cap
+_RATE_LIMIT_JITTER_FACTOR = 0.25  # +/- 25% jitter
+_RATE_LIMIT_MAX_ATTEMPTS = 10  # Maximum number of retry attempts
+
 # Sentinel value to detect when neon_apply_migrations was not overridden
 _MIGRATIONS_NOT_DEFINED = object()
+
+
+class NeonRateLimitError(Exception):
+    """Raised when Neon API rate limit is exceeded and retries are exhausted."""
+
+    pass
+
+
+def _calculate_retry_delay(
+    attempt: int,
+    base_delay: float = _RATE_LIMIT_BASE_DELAY,
+    jitter_factor: float = _RATE_LIMIT_JITTER_FACTOR,
+) -> float:
+    """
+    Calculate delay for a retry attempt with exponential backoff and jitter.
+
+    Args:
+        attempt: The retry attempt number (0-indexed)
+        base_delay: Base delay in seconds
+        jitter_factor: Jitter factor (0.25 means +/- 25%)
+
+    Returns:
+        Delay in seconds with jitter applied
+    """
+    # Exponential backoff: base_delay * 2^attempt
+    delay = base_delay * (2**attempt)
+
+    # Apply jitter: delay * (1 +/- jitter_factor)
+    jitter = delay * jitter_factor * (2 * random.random() - 1)
+    return delay + jitter
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """
+    Check if an exception indicates a rate limit (429) error.
+
+    Handles both requests.HTTPError (with response object) and NeonAPIError
+    (which only has the error text, not the response object).
+
+    Args:
+        exc: The exception to check
+
+    Returns:
+        True if this is a rate limit error, False otherwise
+    """
+    # Check NeonAPIError first - it inherits from HTTPError but doesn't have
+    # a response object, so we need to check the error text
+    if isinstance(exc, NeonAPIError):
+        # NeonAPIError doesn't preserve the response object, only the text
+        # Check for rate limit indicators in the error message
+        # Note: We use "too many requests" specifically to avoid false positives
+        # from errors like "too many connections" or "too many rows"
+        error_text = str(exc).lower()
+        return (
+            "429" in error_text
+            or "rate limit" in error_text
+            or "too many requests" in error_text
+        )
+    if isinstance(exc, requests.HTTPError):
+        return exc.response is not None and exc.response.status_code == 429
+    return False
+
+
+def _get_retry_after_from_error(exc: Exception) -> float | None:
+    """
+    Extract Retry-After header value from an exception if available.
+
+    Args:
+        exc: The exception to check
+
+    Returns:
+        The Retry-After value in seconds, or None if not available
+    """
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return float(retry_after)
+            except ValueError:
+                pass
+    return None
+
+
+def _retry_on_rate_limit(
+    operation: Callable[[], T],
+    operation_name: str,
+    base_delay: float = _RATE_LIMIT_BASE_DELAY,
+    max_total_delay: float = _RATE_LIMIT_MAX_TOTAL_DELAY,
+    jitter_factor: float = _RATE_LIMIT_JITTER_FACTOR,
+    max_attempts: int = _RATE_LIMIT_MAX_ATTEMPTS,
+) -> T:
+    """
+    Execute an operation with retry logic for rate limit (429) errors.
+
+    Uses exponential backoff with jitter. Retries until the operation succeeds,
+    the total delay exceeds max_total_delay, or max_attempts is reached.
+
+    See: https://api-docs.neon.tech/reference/api-rate-limiting
+
+    Args:
+        operation: Callable that may raise requests.HTTPError or NeonAPIError
+        operation_name: Human-readable name for error messages
+        base_delay: Base delay in seconds for first retry
+        max_total_delay: Maximum total delay across all retries
+        jitter_factor: Jitter factor for randomization
+        max_attempts: Maximum number of retry attempts
+
+    Returns:
+        The result of the operation
+
+    Raises:
+        NeonRateLimitError: If rate limit retries are exhausted
+        requests.HTTPError: For non-429 HTTP errors
+        NeonAPIError: For non-429 API errors
+        Exception: For other errors from the operation
+    """
+    total_delay = 0.0
+    attempt = 0
+
+    while True:
+        try:
+            return operation()
+        except (requests.HTTPError, NeonAPIError) as e:
+            if _is_rate_limit_error(e):
+                # Check for Retry-After header (may be added by Neon in future)
+                retry_after = _get_retry_after_from_error(e)
+                if retry_after is not None:
+                    # Ensure minimum delay to prevent infinite loops if Retry-After is 0
+                    delay = max(retry_after, 0.1)
+                else:
+                    delay = _calculate_retry_delay(attempt, base_delay, jitter_factor)
+
+                # Check if we've exceeded max total delay
+                if total_delay + delay > max_total_delay:
+                    raise NeonRateLimitError(
+                        f"Rate limit exceeded for {operation_name}. "
+                        f"Max total delay ({max_total_delay:.1f}s) reached after "
+                        f"{attempt + 1} attempts. "
+                        f"See: https://api-docs.neon.tech/reference/api-rate-limiting"
+                    ) from e
+
+                # Check if we've exceeded max attempts
+                attempt += 1
+                if attempt >= max_attempts:
+                    raise NeonRateLimitError(
+                        f"Rate limit exceeded for {operation_name}. "
+                        f"Max attempts ({max_attempts}) reached after "
+                        f"{total_delay:.1f}s total delay. "
+                        f"See: https://api-docs.neon.tech/reference/api-rate-limiting"
+                    ) from e
+
+                time.sleep(delay)
+                total_delay += delay
+            else:
+                # Non-429 error, re-raise immediately
+                raise
 
 
 def _get_xdist_worker_id() -> str:
@@ -166,7 +334,12 @@ def _get_default_branch_id(neon: NeonAPI, project_id: str) -> str | None:
         The branch ID of the default branch, or None if not found.
     """
     try:
-        response = neon.branches(project_id=project_id)
+        # Wrap in retry logic to handle rate limits
+        # See: https://api-docs.neon.tech/reference/api-rate-limiting
+        response = _retry_on_rate_limit(
+            lambda: neon.branches(project_id=project_id),
+            operation_name="list_branches",
+        )
         for branch in response.branches:
             # Check both 'default' and 'primary' flags for compatibility
             if getattr(branch, "default", False) or getattr(branch, "primary", False):
@@ -375,10 +548,15 @@ def _create_neon_branch(
         branch_config["expires_at"] = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # Create branch with compute endpoint
-    result = neon.branch_create(
-        project_id=project_id,
-        branch=branch_config,
-        endpoints=[{"type": "read_write"}],
+    # Wrap in retry logic to handle rate limits
+    # See: https://api-docs.neon.tech/reference/api-rate-limiting
+    result = _retry_on_rate_limit(
+        lambda: neon.branch_create(
+            project_id=project_id,
+            branch=branch_config,
+            endpoints=[{"type": "read_write"}],
+        ),
+        operation_name="branch_create",
     )
 
     branch = result.branch
@@ -402,8 +580,11 @@ def _create_neon_branch(
     waited = 0.0
 
     while True:
-        endpoint_response = neon.endpoint(
-            project_id=project_id, endpoint_id=endpoint_id
+        # Wrap in retry logic to handle rate limits during polling
+        # See: https://api-docs.neon.tech/reference/api-rate-limiting
+        endpoint_response = _retry_on_rate_limit(
+            lambda: neon.endpoint(project_id=project_id, endpoint_id=endpoint_id),
+            operation_name="endpoint_status",
         )
         endpoint = endpoint_response.endpoint
         state = endpoint.current_state
@@ -436,10 +617,15 @@ def _create_neon_branch(
 
     # Reset password to get the password value
     # (newly created branches don't expose password)
-    password_response = neon.role_password_reset(
-        project_id=project_id,
-        branch_id=branch.id,
-        role_name=role_name,
+    # Wrap in retry logic to handle rate limits
+    # See: https://api-docs.neon.tech/reference/api-rate-limiting
+    password_response = _retry_on_rate_limit(
+        lambda: neon.role_password_reset(
+            project_id=project_id,
+            branch_id=branch.id,
+            role_name=role_name,
+        ),
+        operation_name="role_password_reset",
     )
     password = password_response.role.password
 
@@ -472,30 +658,34 @@ def _create_neon_branch(
         # Cleanup: delete branch unless --neon-keep-branches was specified
         if not keep_branches:
             try:
-                neon.branch_delete(project_id=project_id, branch_id=branch.id)
+                # Wrap in retry logic to handle rate limits
+                # See: https://api-docs.neon.tech/reference/api-rate-limiting
+                _retry_on_rate_limit(
+                    lambda: neon.branch_delete(
+                        project_id=project_id, branch_id=branch.id
+                    ),
+                    operation_name="branch_delete",
+                )
             except Exception as e:
                 # Log but don't fail tests due to cleanup issues
-                import warnings
-
                 warnings.warn(
                     f"Failed to delete Neon branch {branch.id}: {e}",
                     stacklevel=2,
                 )
 
 
-def _reset_branch_to_parent(
-    branch: NeonBranch, api_key: str, max_retries: int = 3
-) -> None:
+def _reset_branch_to_parent(branch: NeonBranch, api_key: str) -> None:
     """Reset a branch to its parent's state using the Neon API.
 
-    Uses exponential backoff retry logic to handle transient API errors
-    that can occur during parallel test execution. After initiating the
-    restore, polls the operation status until it completes.
+    Uses exponential backoff retry logic with jitter to handle rate limit (429)
+    errors. After initiating the restore, polls the operation status until it
+    completes.
+
+    See: https://api-docs.neon.tech/reference/api-rate-limiting
 
     Args:
         branch: The branch to reset
         api_key: Neon API key
-        max_retries: Maximum number of retry attempts (default: 3)
     """
     if not branch.parent_id:
         raise RuntimeError(f"Branch {branch.branch_id} has no parent - cannot reset")
@@ -509,41 +699,31 @@ def _reset_branch_to_parent(
         "Content-Type": "application/json",
     }
 
-    last_error: Exception | None = None
-    for attempt in range(max_retries + 1):
-        try:
-            response = requests.post(
-                restore_url,
-                headers=headers,
-                json={"source_branch_id": branch.parent_id},
-                timeout=30,
-            )
-            response.raise_for_status()
+    def do_restore() -> dict[str, Any]:
+        response = requests.post(
+            restore_url,
+            headers=headers,
+            json={"source_branch_id": branch.parent_id},
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
 
-            # The restore API returns operations that run asynchronously.
-            # We must wait for operations to complete before the next test
-            # starts, otherwise connections may fail during the restore.
-            data = response.json()
-            operations = data.get("operations", [])
+    # Wrap in retry logic to handle rate limits
+    # See: https://api-docs.neon.tech/reference/api-rate-limiting
+    data = _retry_on_rate_limit(do_restore, operation_name="branch_restore")
+    operations = data.get("operations", [])
 
-            if operations:
-                _wait_for_operations(
-                    project_id=branch.project_id,
-                    operations=operations,
-                    headers=headers,
-                    base_url=base_url,
-                )
-
-            return  # Success
-        except requests.RequestException as e:
-            last_error = e
-            if attempt < max_retries:
-                # Exponential backoff: 1s, 2s, 4s
-                wait_time = 2**attempt
-                time.sleep(wait_time)
-
-    # All retries exhausted
-    raise last_error  # type: ignore[misc]
+    # The restore API returns operations that run asynchronously.
+    # We must wait for operations to complete before the next test
+    # starts, otherwise connections may fail during the restore.
+    if operations:
+        _wait_for_operations(
+            project_id=branch.project_id,
+            operations=operations,
+            headers=headers,
+            base_url=base_url,
+        )
 
 
 def _wait_for_operations(
@@ -555,6 +735,9 @@ def _wait_for_operations(
     poll_interval: float = 0.5,
 ) -> None:
     """Wait for Neon operations to complete.
+
+    Handles rate limit (429) errors with exponential backoff retry.
+    See: https://api-docs.neon.tech/reference/api-rate-limiting
 
     Args:
         project_id: The Neon project ID
@@ -589,10 +772,21 @@ def _wait_for_operations(
         still_pending = []
         for op_id in pending_op_ids:
             op_url = f"{base_url}/projects/{project_id}/operations/{op_id}"
-            try:
-                response = requests.get(op_url, headers=headers, timeout=10)
+
+            def get_operation_status(url: str = op_url) -> dict[str, Any]:
+                """Fetch operation status. Default arg captures url by value."""
+                response = requests.get(url, headers=headers, timeout=10)
                 response.raise_for_status()
-                op_data = response.json().get("operation", {})
+                return response.json()
+
+            try:
+                # Wrap in retry logic to handle rate limits
+                # See: https://api-docs.neon.tech/reference/api-rate-limiting
+                result = _retry_on_rate_limit(
+                    get_operation_status,
+                    operation_name=f"operation_status({op_id})",
+                )
+                op_data = result.get("operation", {})
                 status = op_data.get("status")
 
                 if status == "failed":
@@ -601,7 +795,7 @@ def _wait_for_operations(
                 if status not in ("finished", "skipped", "cancelled"):
                     still_pending.append(op_id)
             except requests.RequestException:
-                # On network error, assume still pending and retry
+                # On network error (non-429), assume still pending and retry
                 still_pending.append(op_id)
 
         pending_op_ids = still_pending
