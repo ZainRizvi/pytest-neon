@@ -480,9 +480,17 @@ def _wait_for_operations(
         return  # All operations already complete
 
     waited = 0.0
+    first_poll = True
     while pending_op_ids and waited < max_wait_seconds:
-        time.sleep(poll_interval)
-        waited += poll_interval
+        # Poll immediately first time (operation usually completes instantly),
+        # then wait between subsequent polls
+        if first_poll:
+            time.sleep(0.1)  # Tiny delay to let operation start
+            waited += 0.1
+            first_poll = False
+        else:
+            time.sleep(poll_interval)
+            waited += poll_interval
 
         # Check status of each pending operation
         still_pending = []
