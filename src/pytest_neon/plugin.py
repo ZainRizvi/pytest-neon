@@ -373,8 +373,19 @@ def _create_neon_branch(
                 )
 
 
-def _reset_branch_to_parent(branch: NeonBranch, api_key: str) -> None:
-    """Reset a branch to its parent's state using the Neon API."""
+def _reset_branch_to_parent(
+    branch: NeonBranch, api_key: str, max_retries: int = 3
+) -> None:
+    """Reset a branch to its parent's state using the Neon API.
+
+    Uses exponential backoff retry logic to handle transient API errors
+    that can occur during parallel test execution.
+
+    Args:
+        branch: The branch to reset
+        api_key: Neon API key
+        max_retries: Maximum number of retry attempts (default: 3)
+    """
     if not branch.parent_id:
         raise RuntimeError(f"Branch {branch.branch_id} has no parent - cannot reset")
 
@@ -383,10 +394,27 @@ def _reset_branch_to_parent(branch: NeonBranch, api_key: str) -> None:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    response = requests.post(
-        url, headers=headers, json={"source_branch_id": branch.parent_id}, timeout=30
-    )
-    response.raise_for_status()
+
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json={"source_branch_id": branch.parent_id},
+                timeout=30,
+            )
+            response.raise_for_status()
+            return  # Success
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < max_retries:
+                # Exponential backoff: 1s, 2s, 4s
+                wait_time = 2**attempt
+                time.sleep(wait_time)
+
+    # All retries exhausted
+    raise last_error  # type: ignore[misc]
 
 
 @pytest.fixture(scope="session")

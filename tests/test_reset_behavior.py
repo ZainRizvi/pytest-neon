@@ -1,5 +1,118 @@
 """Tests for branch reset behavior."""
 
+import pytest
+
+from pytest_neon.plugin import NeonBranch, _reset_branch_to_parent
+
+
+class TestResetRetryBehavior:
+    """Test that branch reset retries on transient failures."""
+
+    def test_reset_succeeds_after_transient_failures(self, mocker):
+        """Verify reset retries and succeeds after transient API errors."""
+        branch = NeonBranch(
+            branch_id="br-test",
+            project_id="proj-test",
+            connection_string="postgresql://test",
+            host="test.neon.tech",
+            parent_id="br-parent",
+        )
+
+        # Mock requests.post to fail twice, then succeed
+        mock_response = mocker.Mock()
+        mock_response.raise_for_status = mocker.Mock()
+
+        import requests
+
+        call_count = [0]
+
+        def mock_post(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] < 3:
+                raise requests.RequestException("API rate limited")
+            return mock_response
+
+        mocker.patch("pytest_neon.plugin.requests.post", side_effect=mock_post)
+        mocker.patch("pytest_neon.plugin.time.sleep")  # Don't actually sleep
+
+        # Should succeed after retries
+        _reset_branch_to_parent(branch, "fake-api-key")
+
+        assert call_count[0] == 3  # 2 failures + 1 success
+
+    def test_reset_fails_after_max_retries(self, mocker):
+        """Verify reset raises after exhausting all retries."""
+        branch = NeonBranch(
+            branch_id="br-test",
+            project_id="proj-test",
+            connection_string="postgresql://test",
+            host="test.neon.tech",
+            parent_id="br-parent",
+        )
+
+        # Mock requests.post to always fail
+        import requests
+
+        mocker.patch(
+            "pytest_neon.plugin.requests.post",
+            side_effect=requests.RequestException("API error"),
+        )
+        mock_sleep = mocker.patch("pytest_neon.plugin.time.sleep")
+
+        # Should raise after max retries
+        with pytest.raises(requests.RequestException, match="API error"):
+            _reset_branch_to_parent(branch, "fake-api-key")
+
+        # Should have slept between retries (3 retries = 3 sleeps)
+        assert mock_sleep.call_count == 3
+
+    def test_reset_uses_exponential_backoff(self, mocker):
+        """Verify reset uses exponential backoff between retries."""
+        branch = NeonBranch(
+            branch_id="br-test",
+            project_id="proj-test",
+            connection_string="postgresql://test",
+            host="test.neon.tech",
+            parent_id="br-parent",
+        )
+
+        import requests
+
+        mocker.patch(
+            "pytest_neon.plugin.requests.post",
+            side_effect=requests.RequestException("API error"),
+        )
+        mock_sleep = mocker.patch("pytest_neon.plugin.time.sleep")
+
+        with pytest.raises(requests.RequestException):
+            _reset_branch_to_parent(branch, "fake-api-key")
+
+        # Check exponential backoff: 1s, 2s, 4s
+        sleep_calls = [call[0][0] for call in mock_sleep.call_args_list]
+        assert sleep_calls == [1, 2, 4]
+
+    def test_reset_no_retry_on_success(self, mocker):
+        """Verify reset doesn't retry when successful."""
+        branch = NeonBranch(
+            branch_id="br-test",
+            project_id="proj-test",
+            connection_string="postgresql://test",
+            host="test.neon.tech",
+            parent_id="br-parent",
+        )
+
+        mock_response = mocker.Mock()
+        mock_response.raise_for_status = mocker.Mock()
+        mock_post = mocker.patch(
+            "pytest_neon.plugin.requests.post", return_value=mock_response
+        )
+        mock_sleep = mocker.patch("pytest_neon.plugin.time.sleep")
+
+        _reset_branch_to_parent(branch, "fake-api-key")
+
+        assert mock_post.call_count == 1
+        assert mock_sleep.call_count == 0
+
 
 class TestResetBehavior:
     """Test that branch reset happens between tests."""
