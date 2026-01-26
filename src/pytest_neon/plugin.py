@@ -330,8 +330,8 @@ def _create_neon_branch(
     git_branch = _get_git_branch_name()
     if git_branch:
         # Truncate git branch to 15 chars to keep branch names reasonable
-        truncated_git_branch = git_branch[:15]
-        branch_name = f"pytest-{truncated_git_branch}-{random_suffix}{branch_name_suffix}"
+        git_prefix = git_branch[:15]
+        branch_name = f"pytest-{git_prefix}-{random_suffix}{branch_name_suffix}"
     else:
         branch_name = f"pytest-{random_suffix}{branch_name_suffix}"
 
