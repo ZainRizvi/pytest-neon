@@ -1200,12 +1200,13 @@ wheels = [
 
 [[package]]
 name = "pytest-neon"
-version = "0.1.0"
+version = "0.5.1"
 source = { editable = "." }
 dependencies = [
     { name = "neon-api" },
     { name = "pytest", version = "8.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
     { name = "pytest", version = "9.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "requests" },
 ]
 
 [package.optional-dependencies]
@@ -1235,6 +1236,7 @@ requires-dist = [
     { name = "pytest", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.0" },
+    { name = "requests", specifier = ">=2.20" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
     { name = "sqlalchemy", marker = "extra == 'sqlalchemy'", specifier = ">=2.0" },
 ]
