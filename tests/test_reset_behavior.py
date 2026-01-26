@@ -21,6 +21,8 @@ class TestResetRetryBehavior:
         # Mock requests.post to fail twice, then succeed
         mock_response = mocker.Mock()
         mock_response.raise_for_status = mocker.Mock()
+        # Return empty operations list (already complete)
+        mock_response.json.return_value = {"operations": []}
 
         import requests
 
@@ -103,6 +105,8 @@ class TestResetRetryBehavior:
 
         mock_response = mocker.Mock()
         mock_response.raise_for_status = mocker.Mock()
+        # Return empty operations list (already complete)
+        mock_response.json.return_value = {"operations": []}
         mock_post = mocker.patch(
             "pytest_neon.plugin.requests.post", return_value=mock_response
         )
@@ -112,6 +116,51 @@ class TestResetRetryBehavior:
 
         assert mock_post.call_count == 1
         assert mock_sleep.call_count == 0
+
+    def test_reset_waits_for_operations_to_complete(self, mocker):
+        """Verify reset polls operation status until complete."""
+        branch = NeonBranch(
+            branch_id="br-test",
+            project_id="proj-test",
+            connection_string="postgresql://test",
+            host="test.neon.tech",
+            parent_id="br-parent",
+        )
+
+        # Mock POST response with pending operation
+        mock_post_response = mocker.Mock()
+        mock_post_response.raise_for_status = mocker.Mock()
+        mock_post_response.json.return_value = {
+            "operations": [{"id": "op-123", "status": "running"}]
+        }
+
+        # Mock GET responses: first running, then finished
+        get_call_count = [0]
+
+        def mock_get(*args, **kwargs):
+            get_call_count[0] += 1
+            mock_get_response = mocker.Mock()
+            mock_get_response.raise_for_status = mocker.Mock()
+            if get_call_count[0] < 3:
+                mock_get_response.json.return_value = {
+                    "operation": {"id": "op-123", "status": "running"}
+                }
+            else:
+                mock_get_response.json.return_value = {
+                    "operation": {"id": "op-123", "status": "finished"}
+                }
+            return mock_get_response
+
+        mocker.patch(
+            "pytest_neon.plugin.requests.post", return_value=mock_post_response
+        )
+        mocker.patch("pytest_neon.plugin.requests.get", side_effect=mock_get)
+        mocker.patch("pytest_neon.plugin.time.sleep")
+
+        _reset_branch_to_parent(branch, "fake-api-key")
+
+        # Should have polled until finished
+        assert get_call_count[0] == 3
 
 
 class TestResetBehavior:

@@ -396,7 +396,8 @@ def _reset_branch_to_parent(
     """Reset a branch to its parent's state using the Neon API.
 
     Uses exponential backoff retry logic to handle transient API errors
-    that can occur during parallel test execution.
+    that can occur during parallel test execution. After initiating the
+    restore, polls the operation status until it completes.
 
     Args:
         branch: The branch to reset
@@ -406,7 +407,10 @@ def _reset_branch_to_parent(
     if not branch.parent_id:
         raise RuntimeError(f"Branch {branch.branch_id} has no parent - cannot reset")
 
-    url = f"https://console.neon.tech/api/v2/projects/{branch.project_id}/branches/{branch.branch_id}/restore"
+    base_url = "https://console.neon.tech/api/v2"
+    project_id = branch.project_id
+    branch_id = branch.branch_id
+    restore_url = f"{base_url}/projects/{project_id}/branches/{branch_id}/restore"
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -416,12 +420,27 @@ def _reset_branch_to_parent(
     for attempt in range(max_retries + 1):
         try:
             response = requests.post(
-                url,
+                restore_url,
                 headers=headers,
                 json={"source_branch_id": branch.parent_id},
                 timeout=30,
             )
             response.raise_for_status()
+
+            # The restore API returns operations that run asynchronously.
+            # We must wait for operations to complete before the next test
+            # starts, otherwise connections may fail during the restore.
+            data = response.json()
+            operations = data.get("operations", [])
+
+            if operations:
+                _wait_for_operations(
+                    project_id=branch.project_id,
+                    operations=operations,
+                    headers=headers,
+                    base_url=base_url,
+                )
+
             return  # Success
         except requests.RequestException as e:
             last_error = e
@@ -432,6 +451,64 @@ def _reset_branch_to_parent(
 
     # All retries exhausted
     raise last_error  # type: ignore[misc]
+
+
+def _wait_for_operations(
+    project_id: str,
+    operations: list[dict[str, Any]],
+    headers: dict[str, str],
+    base_url: str,
+    max_wait_seconds: float = 60,
+    poll_interval: float = 0.5,
+) -> None:
+    """Wait for Neon operations to complete.
+
+    Args:
+        project_id: The Neon project ID
+        operations: List of operation dicts from the API response
+        headers: HTTP headers including auth
+        base_url: Base URL for Neon API
+        max_wait_seconds: Maximum time to wait (default: 60s)
+        poll_interval: Time between polls (default: 0.5s)
+    """
+    # Get operation IDs that aren't already finished
+    pending_op_ids = [
+        op["id"] for op in operations if op.get("status") not in ("finished", "skipped")
+    ]
+
+    if not pending_op_ids:
+        return  # All operations already complete
+
+    waited = 0.0
+    while pending_op_ids and waited < max_wait_seconds:
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+        # Check status of each pending operation
+        still_pending = []
+        for op_id in pending_op_ids:
+            op_url = f"{base_url}/projects/{project_id}/operations/{op_id}"
+            try:
+                response = requests.get(op_url, headers=headers, timeout=10)
+                response.raise_for_status()
+                op_data = response.json().get("operation", {})
+                status = op_data.get("status")
+
+                if status == "error":
+                    err = op_data.get("error", "unknown error")
+                    raise RuntimeError(f"Operation {op_id} failed: {err}")
+                if status not in ("finished", "skipped"):
+                    still_pending.append(op_id)
+            except requests.RequestException:
+                # On network error, assume still pending and retry
+                still_pending.append(op_id)
+
+        pending_op_ids = still_pending
+
+    if pending_op_ids:
+        raise RuntimeError(
+            f"Timeout waiting for operations to complete: {pending_op_ids}"
+        )
 
 
 @pytest.fixture(scope="session")
