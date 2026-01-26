@@ -71,17 +71,37 @@ pytest
 
 ## Fixtures
 
-### `neon_branch_readwrite` (recommended for write tests)
+**Which fixture should I use?**
 
-The recommended fixture for tests that modify database state (INSERT, UPDATE, DELETE). Creates one branch per test session, then resets it to the parent branch's state after each test. This provides test isolation with ~0.5s overhead per test.
+- **Use `neon_branch_readonly`** if your test only reads data (SELECT queries). This is the fastest option with no per-test overhead.
+- **Use `neon_branch_readwrite`** if your test modifies data (INSERT, UPDATE, DELETE). This resets the branch after each test for isolation.
 
-Returns a `NeonBranch` dataclass with:
+### `neon_branch_readonly` (recommended, fastest)
 
-- `branch_id`: The Neon branch ID
-- `project_id`: The Neon project ID
-- `connection_string`: Full PostgreSQL connection URI
-- `host`: The database host
-- `parent_id`: The parent branch ID (used for resets)
+**Use this fixture by default** if your tests don't need to write data. It provides the best performance by skipping the branch reset step (~0.5s saved per test), which also reduces API calls and avoids rate limiting issues.
+
+```python
+def test_query_users(neon_branch_readonly):
+    # DATABASE_URL is set automatically
+    import psycopg
+    with psycopg.connect(neon_branch_readonly.connection_string) as conn:
+        result = conn.execute("SELECT * FROM users").fetchall()
+        assert len(result) >= 0
+    # No reset after this test - fast!
+```
+
+**Use this when**:
+- Tests only perform SELECT queries
+- Tests don't modify database state
+- You want maximum performance
+
+**Warning**: If you accidentally write data using this fixture, subsequent tests will see those modifications. The fixture does not enforce read-only access at the database level.
+
+**Performance**: ~1.5s initial setup per session, **no per-test overhead**. For 10 read-only tests, expect only ~1.5s total overhead (vs ~6.5s with readwrite).
+
+### `neon_branch_readwrite` (for write tests)
+
+Use this fixture when your tests need to INSERT, UPDATE, or DELETE data. Creates one branch per test session, then resets it to the parent branch's state after each test. This provides test isolation with ~0.5s overhead per test.
 
 ```python
 import os
@@ -98,30 +118,17 @@ def test_insert_user(neon_branch_readwrite):
     # Branch resets after this test - changes won't affect other tests
 ```
 
-**Performance**: ~1.5s initial setup per session + ~0.5s reset per test. For 10 tests, expect ~6.5s total overhead.
+**Performance**: ~1.5s initial setup per session + ~0.5s reset per test. For 10 write tests, expect ~6.5s total overhead.
 
-### `neon_branch_readonly` (recommended for read-only tests)
+### `NeonBranch` dataclass
 
-The recommended fixture for tests that only read data (SELECT queries). No branch reset occurs after each test, making it faster than `neon_branch_readwrite` (~0.5s saved per test).
+Both fixtures return a `NeonBranch` dataclass with:
 
-```python
-def test_query_users(neon_branch_readonly):
-    # DATABASE_URL is set automatically
-    import psycopg
-    with psycopg.connect(neon_branch_readonly.connection_string) as conn:
-        result = conn.execute("SELECT * FROM users").fetchall()
-        assert len(result) >= 0
-    # No reset after this test - fast!
-```
-
-**Use this when**:
-- Tests only perform SELECT queries
-- Tests don't modify database state
-- You want maximum performance for read-only tests
-
-**Warning**: If you accidentally write data using this fixture, subsequent tests will see those modifications. The fixture does not enforce read-only access at the database level.
-
-**Performance**: ~1.5s initial setup per session, no per-test overhead.
+- `branch_id`: The Neon branch ID
+- `project_id`: The Neon project ID
+- `connection_string`: Full PostgreSQL connection URI
+- `host`: The database host
+- `parent_id`: The parent branch ID (used for resets)
 
 ### `neon_branch` (deprecated)
 

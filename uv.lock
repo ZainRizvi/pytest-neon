@@ -1200,7 +1200,7 @@ wheels = [
 
 [[package]]
 name = "pytest-neon"
-version = "0.5.1"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "neon-api" },
@@ -1212,9 +1212,13 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "mypy" },
+    { name = "psycopg", version = "3.2.13", source = { registry = "https://pypi.org/simple" }, extra = ["binary"], marker = "python_full_version < '3.10'" },
+    { name = "psycopg", version = "3.3.2", source = { registry = "https://pypi.org/simple" }, extra = ["binary"], marker = "python_full_version >= '3.10'" },
+    { name = "psycopg2-binary" },
     { name = "pytest-cov" },
     { name = "pytest-mock" },
     { name = "ruff" },
+    { name = "sqlalchemy" },
 ]
 psycopg = [
     { name = "psycopg", version = "3.2.13", source = { registry = "https://pypi.org/simple" }, extra = ["binary"], marker = "python_full_version < '3.10'" },
@@ -1231,13 +1235,16 @@ sqlalchemy = [
 requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "neon-api", specifier = ">=0.1.0" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'dev'", specifier = ">=3.1" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'psycopg'", specifier = ">=3.1" },
+    { name = "psycopg2-binary", marker = "extra == 'dev'", specifier = ">=2.9" },
     { name = "psycopg2-binary", marker = "extra == 'psycopg2'", specifier = ">=2.9" },
     { name = "pytest", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.0" },
     { name = "requests", specifier = ">=2.20" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.8" },
+    { name = "sqlalchemy", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "sqlalchemy", marker = "extra == 'sqlalchemy'", specifier = ">=2.0" },
 ]
 provides-extras = ["psycopg2", "psycopg", "sqlalchemy", "dev"]
