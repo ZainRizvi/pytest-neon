@@ -186,8 +186,8 @@ class TestCalculateRetryDelay:
         delay2 = _calculate_retry_delay(2, base_delay=4.0, jitter_factor=0.0)
         delay3 = _calculate_retry_delay(3, base_delay=4.0, jitter_factor=0.0)
 
-        assert delay0 == 4.0   # 4 * 2^0 = 4
-        assert delay1 == 8.0   # 4 * 2^1 = 8
+        assert delay0 == 4.0  # 4 * 2^0 = 4
+        assert delay1 == 8.0  # 4 * 2^1 = 8
         assert delay2 == 16.0  # 4 * 2^2 = 16
         assert delay3 == 32.0  # 4 * 2^3 = 32
 
