@@ -444,6 +444,21 @@ The `neon_branch_readwrite` fixture uses Neon's branch restore API to reset data
 
 This is similar to database transactions but at the branch level.
 
+## Branch Naming
+
+Branches are automatically named to help identify their source:
+
+```
+pytest-[git-branch]-[random]-[suffix]
+```
+
+**Examples:**
+- `pytest-main-a1b2-migrated` - Migration branch from `main`
+- `pytest-feature-auth-c3d4-test-main` - Test branch from `feature/auth`
+- `pytest-a1b2-migrated` - When not in a git repo
+
+The git branch name is sanitized (only `a-z`, `0-9`, `-`, `_` allowed) and truncated to 15 characters. This makes it easy to identify orphaned branches in the Neon console.
+
 ## Parallel Test Execution (pytest-xdist)
 
 This plugin supports parallel test execution with [pytest-xdist](https://pytest-xdist.readthedocs.io/). Each xdist worker automatically gets its own isolated branch.
