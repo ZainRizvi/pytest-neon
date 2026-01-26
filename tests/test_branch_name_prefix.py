@@ -1,5 +1,6 @@
 """Tests for git branch name in Neon branch names."""
 
+import contextlib
 from unittest.mock import MagicMock, patch
 
 from neon_api.schema import EndpointState
@@ -165,13 +166,11 @@ class TestBranchNameWithGitBranch:
             mock_api.role_password_reset.return_value = mock_password
 
             gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
-            try:
+            with contextlib.suppress(StopIteration):
                 next(gen)
-            except StopIteration:
-                pass
 
             assert captured_branch_name is not None
-            # Git branch "feature/my-branch" -> sanitized to "feature-my-branch" -> first 15 chars
+            # Git branch "feature/my-branch" sanitized to "feature-my-branch"
             assert captured_branch_name.startswith("pytest-feature-my-bran-")
             assert captured_branch_name.endswith("-migrated")
 
@@ -208,8 +207,8 @@ class TestBranchNameWithGitBranch:
 
         with patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls, \
              patch("pytest_neon.plugin._get_git_branch_name") as mock_git:
-            # _get_git_branch_name returns sanitized value (slashes -> hyphens)
-            mock_git.return_value = "feature-very-long-branch-name-that-needs-truncation"
+            # _get_git_branch_name returns sanitized value
+            mock_git.return_value = "feature-very-long-branch-name-truncated"
 
             mock_api = MagicMock()
             mock_neon_cls.return_value = mock_api
@@ -239,14 +238,11 @@ class TestBranchNameWithGitBranch:
             mock_api.role_password_reset.return_value = mock_password
 
             gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
-            try:
+            with contextlib.suppress(StopIteration):
                 next(gen)
-            except StopIteration:
-                pass
 
             assert captured_branch_name is not None
-            # "feature/very-long-branch-name..." sanitized -> "feature-very-long-branch-name..."
-            # First 15 chars = "feature-very-lo"
+            # Long branch sanitized and truncated to first 15 chars
             assert captured_branch_name.startswith("pytest-feature-very-lo-")
             assert captured_branch_name.endswith("-migrated")
 
@@ -313,10 +309,8 @@ class TestBranchNameWithGitBranch:
             mock_api.role_password_reset.return_value = mock_password
 
             gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
-            try:
+            with contextlib.suppress(StopIteration):
                 next(gen)
-            except StopIteration:
-                pass
 
             assert captured_branch_name is not None
             # Without git: pytest-[4 hex chars]-migrated
