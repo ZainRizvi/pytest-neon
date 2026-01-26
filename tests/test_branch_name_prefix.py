@@ -133,8 +133,10 @@ class TestBranchNameWithGitBranch:
         mock_config.getoption.side_effect = mock_getoption
         mock_config.getini.side_effect = mock_getini
 
-        with patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls, \
-             patch("pytest_neon.plugin._get_git_branch_name") as mock_git:
+        with (
+            patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
+            patch("pytest_neon.plugin._get_git_branch_name") as mock_git,
+        ):
             # _get_git_branch_name returns sanitized value (slashes -> hyphens)
             mock_git.return_value = "feature-my-branch"
 
@@ -205,8 +207,10 @@ class TestBranchNameWithGitBranch:
         mock_config.getoption.side_effect = mock_getoption
         mock_config.getini.side_effect = mock_getini
 
-        with patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls, \
-             patch("pytest_neon.plugin._get_git_branch_name") as mock_git:
+        with (
+            patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
+            patch("pytest_neon.plugin._get_git_branch_name") as mock_git,
+        ):
             # _get_git_branch_name returns sanitized value
             mock_git.return_value = "feature-very-long-branch-name-truncated"
 
@@ -277,8 +281,10 @@ class TestBranchNameWithGitBranch:
         mock_config.getoption.side_effect = mock_getoption
         mock_config.getini.side_effect = mock_getini
 
-        with patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls, \
-             patch("pytest_neon.plugin._get_git_branch_name") as mock_git:
+        with (
+            patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
+            patch("pytest_neon.plugin._get_git_branch_name") as mock_git,
+        ):
             mock_git.return_value = None  # Not in a git repo
 
             mock_api = MagicMock()
