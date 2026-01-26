@@ -444,16 +444,26 @@ The `neon_branch_readwrite` fixture uses Neon's branch restore API to reset data
 
 This is similar to database transactions but at the branch level.
 
-## Limitations
+## Parallel Test Execution (pytest-xdist)
 
-### Parallel Test Execution
+This plugin supports parallel test execution with [pytest-xdist](https://pytest-xdist.readthedocs.io/). Each xdist worker automatically gets its own isolated branch.
 
-This plugin sets the `DATABASE_URL` environment variable, which is process-global. This means it is **not compatible with pytest-xdist** or other parallel test runners that run tests in the same process.
+```bash
+# Run tests in parallel with 4 workers
+pip install pytest-xdist
+pytest -n 4
+```
 
-If you need parallel execution, you can:
-- Use `neon_branch.connection_string` directly instead of relying on `DATABASE_URL`
-- Run with `pytest-xdist --dist=loadfile` to keep modules in separate processes
-- Run tests serially (default pytest behavior)
+**How it works:**
+- Each xdist worker (gw0, gw1, gw2, etc.) creates its own branch
+- Branches are named with the worker ID suffix (e.g., `-test-gw0`, `-test-gw1`)
+- Workers run tests in parallel without database state interference
+- All branches are cleaned up after the test session
+
+**Cost implications:**
+- Running with `-n 4` creates 4 branches (one per worker) plus the migration branch
+- Choose your parallelism level based on your Neon plan's branch limits
+- Each worker's branch is reset after each test using the fast reset operation (~0.5s)
 
 ## Troubleshooting
 
