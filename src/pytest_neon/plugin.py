@@ -502,10 +502,10 @@ def _wait_for_operations(
                 op_data = response.json().get("operation", {})
                 status = op_data.get("status")
 
-                if status == "error":
+                if status == "failed":
                     err = op_data.get("error", "unknown error")
                     raise RuntimeError(f"Operation {op_id} failed: {err}")
-                if status not in ("finished", "skipped"):
+                if status not in ("finished", "skipped", "cancelled"):
                     still_pending.append(op_id)
             except requests.RequestException:
                 # On network error, assume still pending and retry

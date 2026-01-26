@@ -162,6 +162,43 @@ class TestResetRetryBehavior:
         # Should have polled until finished
         assert get_call_count[0] == 3
 
+    def test_reset_raises_on_failed_operation(self, mocker):
+        """Verify reset raises RuntimeError when operation fails."""
+        branch = NeonBranch(
+            branch_id="br-test",
+            project_id="proj-test",
+            connection_string="postgresql://test",
+            host="test.neon.tech",
+            parent_id="br-parent",
+        )
+
+        # Mock POST response with pending operation
+        mock_post_response = mocker.Mock()
+        mock_post_response.raise_for_status = mocker.Mock()
+        mock_post_response.json.return_value = {
+            "operations": [{"id": "op-123", "status": "running"}]
+        }
+
+        # Mock GET response: operation failed
+        mock_get_response = mocker.Mock()
+        mock_get_response.raise_for_status = mocker.Mock()
+        mock_get_response.json.return_value = {
+            "operation": {
+                "id": "op-123",
+                "status": "failed",
+                "error": "Something went wrong",
+            }
+        }
+
+        mocker.patch(
+            "pytest_neon.plugin.requests.post", return_value=mock_post_response
+        )
+        mocker.patch("pytest_neon.plugin.requests.get", return_value=mock_get_response)
+        mocker.patch("pytest_neon.plugin.time.sleep")
+
+        with pytest.raises(RuntimeError, match="Operation op-123 failed"):
+            _reset_branch_to_parent(branch, "fake-api-key")
+
 
 class TestResetBehavior:
     """Test that branch reset happens between tests."""
