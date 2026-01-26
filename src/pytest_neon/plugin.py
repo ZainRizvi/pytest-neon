@@ -67,12 +67,32 @@ def _get_xdist_worker_id() -> str:
     return os.environ.get("PYTEST_XDIST_WORKER", "main")
 
 
+def _sanitize_branch_name(name: str) -> str:
+    """
+    Sanitize a string for use in Neon branch names.
+
+    Replaces characters that could cause issues with display or URLs
+    with hyphens, and collapses multiple hyphens into one.
+    """
+    import re
+
+    # Replace slashes, spaces, and other potentially problematic chars with hyphens
+    sanitized = re.sub(r"[/\\@#$%^&*()+=\[\]{}|;:'\",<>?`~ ]", "-", name)
+    # Collapse multiple hyphens into one
+    sanitized = re.sub(r"-+", "-", sanitized)
+    # Remove leading/trailing hyphens
+    sanitized = sanitized.strip("-")
+    return sanitized
+
+
 def _get_git_branch_name() -> str | None:
     """
-    Get the current git branch name, or None if not in a git repo.
+    Get the current git branch name (sanitized), or None if not in a git repo.
 
     Used to include the git branch in Neon branch names, making it easier
     to identify which git branch/PR created orphaned test branches.
+
+    The branch name is sanitized to replace special characters with hyphens.
     """
     import subprocess
 
@@ -84,7 +104,8 @@ def _get_git_branch_name() -> str | None:
             timeout=5,
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            branch = result.stdout.strip()
+            return _sanitize_branch_name(branch) if branch else None
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
     return None

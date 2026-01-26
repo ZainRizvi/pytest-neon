@@ -5,6 +5,42 @@ from unittest.mock import MagicMock, patch
 from neon_api.schema import EndpointState
 
 
+class TestSanitizeBranchName:
+    """Tests for _sanitize_branch_name helper."""
+
+    def test_replaces_slashes(self):
+        """Replaces forward slashes with hyphens."""
+        from pytest_neon.plugin import _sanitize_branch_name
+
+        assert _sanitize_branch_name("feature/my-branch") == "feature-my-branch"
+
+    def test_replaces_multiple_special_chars(self):
+        """Replaces various special characters with hyphens."""
+        from pytest_neon.plugin import _sanitize_branch_name
+
+        assert _sanitize_branch_name("feat@user#123") == "feat-user-123"
+
+    def test_collapses_multiple_hyphens(self):
+        """Collapses multiple consecutive hyphens into one."""
+        from pytest_neon.plugin import _sanitize_branch_name
+
+        assert _sanitize_branch_name("feature//branch") == "feature-branch"
+        assert _sanitize_branch_name("a---b") == "a-b"
+
+    def test_strips_leading_trailing_hyphens(self):
+        """Removes leading and trailing hyphens."""
+        from pytest_neon.plugin import _sanitize_branch_name
+
+        assert _sanitize_branch_name("/feature/") == "feature"
+        assert _sanitize_branch_name("--branch--") == "branch"
+
+    def test_preserves_valid_chars(self):
+        """Preserves alphanumeric chars, hyphens, underscores, and dots."""
+        from pytest_neon.plugin import _sanitize_branch_name
+
+        assert _sanitize_branch_name("my-branch_v1.0") == "my-branch_v1.0"
+
+
 class TestGetGitBranchName:
     """Tests for _get_git_branch_name helper."""
 
@@ -84,7 +120,8 @@ class TestBranchNameWithGitBranch:
 
         with patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls, \
              patch("pytest_neon.plugin._get_git_branch_name") as mock_git:
-            mock_git.return_value = "feature/my-branch"
+            # _get_git_branch_name returns sanitized value (slashes -> hyphens)
+            mock_git.return_value = "feature-my-branch"
 
             mock_api = MagicMock()
             mock_neon_cls.return_value = mock_api
@@ -120,8 +157,8 @@ class TestBranchNameWithGitBranch:
                 pass
 
             assert captured_branch_name is not None
-            # Git branch "feature/my-branch" -> first 15 chars
-            assert captured_branch_name.startswith("pytest-feature/my-bran-")
+            # Git branch "feature/my-branch" -> sanitized to "feature-my-branch" -> first 15 chars
+            assert captured_branch_name.startswith("pytest-feature-my-bran-")
             assert captured_branch_name.endswith("-migrated")
 
     def test_branch_name_truncates_long_git_branch(self):
@@ -157,7 +194,8 @@ class TestBranchNameWithGitBranch:
 
         with patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls, \
              patch("pytest_neon.plugin._get_git_branch_name") as mock_git:
-            mock_git.return_value = "feature/very-long-branch-name-that-needs-truncation"
+            # _get_git_branch_name returns sanitized value (slashes -> hyphens)
+            mock_git.return_value = "feature-very-long-branch-name-that-needs-truncation"
 
             mock_api = MagicMock()
             mock_neon_cls.return_value = mock_api
@@ -193,8 +231,9 @@ class TestBranchNameWithGitBranch:
                 pass
 
             assert captured_branch_name is not None
-            # First 15 chars of "feature/very-long-branch-name..." = "feature/very-lo"
-            assert captured_branch_name.startswith("pytest-feature/very-lo-")
+            # "feature/very-long-branch-name..." sanitized -> "feature-very-long-branch-name..."
+            # First 15 chars = "feature-very-lo"
+            assert captured_branch_name.startswith("pytest-feature-very-lo-")
             assert captured_branch_name.endswith("-migrated")
 
     def test_branch_name_without_git(self):
