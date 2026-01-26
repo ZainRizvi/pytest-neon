@@ -13,7 +13,10 @@ This is a pytest plugin that provides isolated Neon database branches for integr
 - **Entry point**: `src/pytest_neon/plugin.py` - Contains all fixtures and pytest hooks
 - **Migration fixture**: `_neon_migration_branch` - Session-scoped, parent for all test branches
 - **User migration hook**: `neon_apply_migrations` - Session-scoped no-op, users override to run migrations
-- **Core fixture**: `neon_branch` - Creates branch (session-scoped), resets after each test (function-scoped wrapper), sets `DATABASE_URL`, yields `NeonBranch` dataclass
+- **Core fixtures**:
+  - `neon_branch_readwrite` - Function-scoped, resets after each test (recommended for write tests)
+  - `neon_branch_readonly` - Function-scoped, NO reset (recommended for read-only tests, faster)
+  - `neon_branch` - Deprecated alias for `neon_branch_readwrite`
 - **Shared fixture**: `neon_branch_shared` - Module-scoped, no reset between tests
 - **Convenience fixtures**: `neon_connection`, `neon_connection_psycopg`, `neon_engine` - Optional, require extras
 
@@ -28,7 +31,9 @@ This is a pytest plugin that provides isolated Neon database branches for integr
 - `_neon_migration_branch`: `scope="session"` - internal, parent for all test branches, migrations run here
 - `neon_apply_migrations`: `scope="session"` - user overrides to run migrations
 - `_neon_branch_for_reset`: `scope="session"` - internal, creates one branch per session from migration branch
-- `neon_branch`: `scope="function"` - wraps the above, resets branch after each test
+- `neon_branch_readwrite`: `scope="function"` - resets branch after each test (for write tests)
+- `neon_branch_readonly`: `scope="function"` - NO reset (for read-only tests, faster)
+- `neon_branch`: `scope="function"` - deprecated alias for `neon_branch_readwrite`
 - `neon_branch_shared`: `scope="module"` - one branch per test file, no reset
 - Connection fixtures: `scope="function"` (default) - fresh connection per test
 

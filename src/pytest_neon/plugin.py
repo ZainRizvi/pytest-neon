@@ -5,21 +5,26 @@ instant branching feature. Each test gets a clean database state via
 branch reset after each test.
 
 Main fixtures:
-    neon_branch: Primary fixture - one branch per session, reset after each test
-    neon_branch_shared: Shared branch without reset (fastest, no isolation)
+    neon_branch_readwrite: Read-write access with reset after each test (recommended)
+    neon_branch_readonly: Read-only access, no reset (fastest for read-only tests)
+    neon_branch: Deprecated alias for neon_branch_readwrite
+    neon_branch_shared: Shared branch without reset (module-scoped)
     neon_connection: psycopg2 connection (requires psycopg2 extra)
     neon_connection_psycopg: psycopg v3 connection (requires psycopg extra)
     neon_engine: SQLAlchemy engine (requires sqlalchemy extra)
 
 SQLAlchemy Users:
     If you create your own SQLAlchemy engine (not using neon_engine fixture),
-    you MUST use pool_pre_ping=True:
+    you MUST use pool_pre_ping=True when using neon_branch_readwrite:
 
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
     This is required because branch resets terminate server-side connections.
     Without pool_pre_ping, SQLAlchemy may try to reuse dead pooled connections,
     causing "SSL connection has been closed unexpectedly" errors.
+
+    Note: pool_pre_ping is not required for neon_branch_readonly since no
+    resets occur.
 
 Configuration:
     Set NEON_API_KEY and NEON_PROJECT_ID environment variables, or use
@@ -33,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import os
 import time
+import warnings
 from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -566,16 +572,21 @@ def _neon_branch_for_reset(
 
 
 @pytest.fixture(scope="function")
-def neon_branch(
+def neon_branch_readwrite(
     request: pytest.FixtureRequest,
     _neon_branch_for_reset: NeonBranch,
 ) -> Generator[NeonBranch, None, None]:
     """
-    Provide an isolated Neon database branch for each test.
+    Provide a read-write Neon database branch with reset after each test.
 
-    This is the primary fixture for database testing. It creates one branch per
-    test session, then resets it to the parent branch's state after each test.
-    This provides test isolation with ~0.5s overhead per test.
+    This is the recommended fixture for tests that modify database state.
+    It creates one branch per test session, then resets it to the parent
+    branch's state after each test. This provides test isolation with
+    ~0.5s overhead per test.
+
+    Use this fixture when your tests INSERT, UPDATE, or DELETE data.
+    For read-only tests, use ``neon_branch_readonly`` instead for better
+    performance (no reset overhead).
 
     The branch is automatically deleted after all tests complete, unless
     --neon-keep-branches is specified. Branches also auto-expire after
@@ -603,11 +614,16 @@ def neon_branch(
 
     Example::
 
-        def test_database_operation(neon_branch):
+        def test_insert_user(neon_branch_readwrite):
             # DATABASE_URL is automatically set
             conn_string = os.environ["DATABASE_URL"]
             # or use directly
-            conn_string = neon_branch.connection_string
+            conn_string = neon_branch_readwrite.connection_string
+
+            # Insert data - branch will reset after this test
+            with psycopg.connect(conn_string) as conn:
+                conn.execute("INSERT INTO users (name) VALUES ('test')")
+                conn.commit()
     """
     config = request.config
     api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY", "neon_api_key")
@@ -616,8 +632,9 @@ def neon_branch(
     if not _neon_branch_for_reset.parent_id:
         pytest.fail(
             f"\n\nBranch {_neon_branch_for_reset.branch_id} has no parent. "
-            f"The neon_branch fixture requires a parent branch for reset.\n\n"
-            f"Use neon_branch_shared if you don't need reset, or specify "
+            f"The neon_branch_readwrite fixture requires a parent branch for "
+            f"reset.\n\n"
+            f"Use neon_branch_readonly if you don't need reset, or specify "
             f"a parent branch with --neon-parent-branch or NEON_PARENT_BRANCH_ID."
         )
 
@@ -634,6 +651,77 @@ def neon_branch(
                 f"database state.\n\nError: {e}\n\n"
                 f"To keep the branch for debugging, use --neon-keep-branches"
             )
+
+
+@pytest.fixture(scope="function")
+def neon_branch_readonly(
+    _neon_branch_for_reset: NeonBranch,
+) -> NeonBranch:
+    """
+    Provide a read-only Neon database branch without reset.
+
+    This is the recommended fixture for tests that only read data (SELECT queries).
+    No branch reset occurs after each test, making it faster than
+    ``neon_branch_readwrite`` (~0.5s saved per test).
+
+    Use this fixture when your tests only perform SELECT queries and don't
+    modify database state. For tests that INSERT, UPDATE, or DELETE data,
+    use ``neon_branch_readwrite`` instead to ensure test isolation.
+
+    Warning:
+        If you accidentally write data using this fixture, subsequent tests
+        will see those modifications. The fixture does not enforce read-only
+        access at the database level - it simply skips the reset step.
+
+    The connection string is automatically set in the DATABASE_URL environment
+    variable (configurable via --neon-env-var).
+
+    Requires either:
+        - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
+        - --neon-api-key and --neon-project-id command line options
+
+    Yields:
+        NeonBranch: Object with branch_id, project_id, connection_string, and host.
+
+    Example::
+
+        def test_query_users(neon_branch_readonly):
+            # DATABASE_URL is automatically set
+            conn_string = os.environ["DATABASE_URL"]
+
+            # Read-only query - no reset needed after this test
+            with psycopg.connect(conn_string) as conn:
+                result = conn.execute("SELECT * FROM users").fetchall()
+                assert len(result) > 0
+    """
+    return _neon_branch_for_reset
+
+
+@pytest.fixture(scope="function")
+def neon_branch(
+    request: pytest.FixtureRequest,
+    neon_branch_readwrite: NeonBranch,
+) -> Generator[NeonBranch, None, None]:
+    """
+    Deprecated: Use ``neon_branch_readwrite`` or ``neon_branch_readonly`` instead.
+
+    This fixture is an alias for ``neon_branch_readwrite`` and will be removed
+    in a future version. Please migrate to the explicit fixture names:
+
+    - ``neon_branch_readwrite``: For tests that modify data (INSERT/UPDATE/DELETE)
+    - ``neon_branch_readonly``: For tests that only read data (SELECT)
+
+    .. deprecated:: 1.1.0
+        Use ``neon_branch_readwrite`` for read-write access with reset,
+        or ``neon_branch_readonly`` for read-only access without reset.
+    """
+    warnings.warn(
+        "neon_branch is deprecated. Use neon_branch_readwrite (for tests that "
+        "modify data) or neon_branch_readonly (for read-only tests) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    yield neon_branch_readwrite
 
 
 @pytest.fixture(scope="module")
