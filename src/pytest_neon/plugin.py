@@ -110,6 +110,30 @@ class NeonBranch:
     parent_id: str | None = None
 
 
+def _get_default_branch_id(neon: NeonAPI, project_id: str) -> str | None:
+    """
+    Get the default/primary branch ID for a project.
+
+    This is used as a safety check to ensure we never accidentally
+    perform destructive operations (like password reset) on the
+    production branch.
+
+    Returns:
+        The branch ID of the default branch, or None if not found.
+    """
+    try:
+        response = neon.branches(project_id=project_id)
+        for branch in response.branches:
+            # Check both 'default' and 'primary' flags for compatibility
+            if getattr(branch, "default", False) or getattr(branch, "primary", False):
+                return branch.id
+    except Exception:
+        # If we can't fetch branches, don't block - the safety check
+        # will be skipped but tests can still run
+        pass
+    return None
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     """Add Neon-specific command line options and ini settings."""
     group = parser.getgroup("neon", "Neon database branching")
@@ -279,6 +303,10 @@ def _create_neon_branch(
 
     neon = NeonAPI(api_key=api_key)
 
+    # Cache the default branch ID for safety checks (only fetch once per session)
+    if not hasattr(config, "_neon_default_branch_id"):
+        config._neon_default_branch_id = _get_default_branch_id(neon, project_id)  # type: ignore[attr-defined]
+
     # Generate unique branch name
     branch_name = f"pytest-{os.urandom(4).hex()}{branch_name_suffix}"
 
@@ -340,6 +368,18 @@ def _create_neon_branch(
         waited += poll_interval
 
     host = endpoint.host
+
+    # SAFETY CHECK: Ensure we never reset password on the default/production branch
+    # This should be impossible since we just created this branch, but we check
+    # defensively to prevent catastrophic mistakes if there's ever a bug
+    default_branch_id = getattr(config, "_neon_default_branch_id", None)
+    if default_branch_id and branch.id == default_branch_id:
+        raise RuntimeError(
+            f"SAFETY CHECK FAILED: Attempted to reset password on default branch "
+            f"{branch.id}. This should never happen - the plugin creates new "
+            f"branches and should never operate on the default branch. "
+            f"Please report this bug at https://github.com/ZainRizvi/pytest-neon/issues"
+        )
 
     # Reset password to get the password value
     # (newly created branches don't expose password)
