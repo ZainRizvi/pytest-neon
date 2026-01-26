@@ -71,13 +71,13 @@ def _sanitize_branch_name(name: str) -> str:
     """
     Sanitize a string for use in Neon branch names.
 
-    Replaces characters that could cause issues with display or URLs
-    with hyphens, and collapses multiple hyphens into one.
+    Only allows alphanumeric characters, hyphens, and underscores.
+    All other characters (including non-ASCII) are replaced with hyphens.
     """
     import re
 
-    # Replace slashes, spaces, and other potentially problematic chars with hyphens
-    sanitized = re.sub(r"[/\\@#$%^&*()+=\[\]{}|;:'\",<>?`~ ]", "-", name)
+    # Replace anything that's not alphanumeric, hyphen, or underscore with hyphen
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "-", name)
     # Collapse multiple hyphens into one
     sanitized = re.sub(r"-+", "-", sanitized)
     # Remove leading/trailing hyphens

@@ -35,10 +35,24 @@ class TestSanitizeBranchName:
         assert _sanitize_branch_name("--branch--") == "branch"
 
     def test_preserves_valid_chars(self):
-        """Preserves alphanumeric chars, hyphens, underscores, and dots."""
+        """Preserves alphanumeric chars, hyphens, and underscores."""
         from pytest_neon.plugin import _sanitize_branch_name
 
-        assert _sanitize_branch_name("my-branch_v1.0") == "my-branch_v1.0"
+        assert _sanitize_branch_name("my-branch_v1") == "my-branch_v1"
+
+    def test_replaces_dots(self):
+        """Replaces dots with hyphens."""
+        from pytest_neon.plugin import _sanitize_branch_name
+
+        assert _sanitize_branch_name("v1.0.0") == "v1-0-0"
+
+    def test_replaces_non_ascii(self):
+        """Replaces non-ASCII characters with hyphens."""
+        from pytest_neon.plugin import _sanitize_branch_name
+
+        assert _sanitize_branch_name("feature-über") == "feature-ber"
+        assert _sanitize_branch_name("日本語branch") == "branch"
+        assert _sanitize_branch_name("test™") == "test"
 
 
 class TestGetGitBranchName:
