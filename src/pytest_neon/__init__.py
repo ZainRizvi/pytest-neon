@@ -9,7 +9,7 @@ from pytest_neon.plugin import (
     neon_engine,
 )
 
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 __all__ = [
     "NeonBranch",
     "neon_branch",
