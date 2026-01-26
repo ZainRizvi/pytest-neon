@@ -1,7 +1,5 @@
 """Tests for pytest-xdist parallel worker support."""
 
-import pytest
-
 
 class TestXdistBranchIsolation:
     """Test that parallel workers get separate branches."""
@@ -43,28 +41,33 @@ class TestXdistBranchIsolation:
                 return _MIGRATIONS_NOT_DEFINED
 
             @pytest.fixture(scope="session")
-            def _neon_branch_for_reset(request, _neon_migration_branch, neon_apply_migrations):
+            def _neon_branch_for_reset(
+                request, _neon_migration_branch, neon_apply_migrations
+            ):
                 # Replicate the real logic
-                migrations_defined = neon_apply_migrations is not _MIGRATIONS_NOT_DEFINED
-                pre_fingerprint = getattr(request.config, "_neon_pre_migration_fingerprint", ())
+                sentinel = _MIGRATIONS_NOT_DEFINED
+                migrations_defined = neon_apply_migrations is not sentinel
+                fingerprint_key = "_neon_pre_migration_fingerprint"
+                pre_fp = getattr(request.config, fingerprint_key, ())
                 schema_changed = False
 
-                if migrations_defined and pre_fingerprint:
-                    schema_changed = False  # Simplified - no real comparison
-                elif migrations_defined and not pre_fingerprint:
+                if migrations_defined and pre_fp:
+                    schema_changed = False  # Simplified
+                elif migrations_defined and not pre_fp:
                     schema_changed = True
 
                 worker_id = _get_xdist_worker_id()
-                branch_suffix = f"-test-{worker_id}"
+                suffix = f"-test-{worker_id}"
 
-                # Key test: should create branch even without schema changes when xdist
+                # Key: create branch even without schema changes when xdist
                 if schema_changed or worker_id != "main":
-                    branch_creation_calls.append(f"created-branch{branch_suffix}")
+                    branch_creation_calls.append(f"created-branch{suffix}")
+                    conn = f"postgresql://mock:mock@t{suffix}.neon.tech/db"
                     branch_info = NeonBranch(
-                        branch_id=f"br-test{branch_suffix}",
+                        branch_id=f"br-test{suffix}",
                         project_id="proj-mock",
-                        connection_string=f"postgresql://mock:mock@test{branch_suffix}.neon.tech/mockdb",
-                        host=f"test{branch_suffix}.neon.tech",
+                        connection_string=conn,
+                        host=f"t{suffix}.neon.tech",
                         parent_id=_neon_migration_branch.branch_id,
                     )
                 else:
@@ -80,7 +83,7 @@ class TestXdistBranchIsolation:
             @pytest.fixture(scope="session", autouse=True)
             def verify_branch_created():
                 yield
-                # Under xdist, should create a new branch even without migrations
+                # Under xdist, should create a new branch
                 assert branch_creation_calls == ["created-branch-test-gw0"]
             """
         )
@@ -130,26 +133,31 @@ class TestXdistBranchIsolation:
                 return _MIGRATIONS_NOT_DEFINED
 
             @pytest.fixture(scope="session")
-            def _neon_branch_for_reset(request, _neon_migration_branch, neon_apply_migrations):
-                migrations_defined = neon_apply_migrations is not _MIGRATIONS_NOT_DEFINED
-                pre_fingerprint = getattr(request.config, "_neon_pre_migration_fingerprint", ())
+            def _neon_branch_for_reset(
+                request, _neon_migration_branch, neon_apply_migrations
+            ):
+                sentinel = _MIGRATIONS_NOT_DEFINED
+                migrations_defined = neon_apply_migrations is not sentinel
+                fingerprint_key = "_neon_pre_migration_fingerprint"
+                pre_fp = getattr(request.config, fingerprint_key, ())
                 schema_changed = False
 
-                if migrations_defined and pre_fingerprint:
+                if migrations_defined and pre_fp:
                     schema_changed = False
-                elif migrations_defined and not pre_fingerprint:
+                elif migrations_defined and not pre_fp:
                     schema_changed = True
 
                 worker_id = _get_xdist_worker_id()
-                branch_suffix = f"-test-{worker_id}"
+                suffix = f"-test-{worker_id}"
 
                 if schema_changed or worker_id != "main":
-                    branch_creation_calls.append(f"created-branch{branch_suffix}")
+                    branch_creation_calls.append(f"created-branch{suffix}")
+                    conn = f"postgresql://mock:mock@t{suffix}.neon.tech/db"
                     branch_info = NeonBranch(
-                        branch_id=f"br-test{branch_suffix}",
+                        branch_id=f"br-test{suffix}",
                         project_id="proj-mock",
-                        connection_string=f"postgresql://mock:mock@test{branch_suffix}.neon.tech/mockdb",
-                        host=f"test{branch_suffix}.neon.tech",
+                        connection_string=conn,
+                        host=f"t{suffix}.neon.tech",
                         parent_id=_neon_migration_branch.branch_id,
                     )
                 else:
@@ -165,7 +173,7 @@ class TestXdistBranchIsolation:
             @pytest.fixture(scope="session", autouse=True)
             def verify_branch_reused():
                 yield
-                # Without xdist and without migrations, should reuse migration branch
+                # Without xdist, should reuse migration branch
                 assert branch_creation_calls == ["reused-migration-branch"]
             """
         )
