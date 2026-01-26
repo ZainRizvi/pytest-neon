@@ -67,6 +67,29 @@ def _get_xdist_worker_id() -> str:
     return os.environ.get("PYTEST_XDIST_WORKER", "main")
 
 
+def _get_git_branch_name() -> str | None:
+    """
+    Get the current git branch name, or None if not in a git repo.
+
+    Used to include the git branch in Neon branch names, making it easier
+    to identify which git branch/PR created orphaned test branches.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
+
+
 def _get_schema_fingerprint(connection_string: str) -> tuple[tuple[Any, ...], ...]:
     """
     Get a fingerprint of the database schema for change detection.
@@ -160,11 +183,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         dest="neon_env_var",
         help="Environment variable to set with connection string (default: DATABASE_URL)",  # noqa: E501
     )
-    group.addoption(
-        "--neon-branch-name-prefix",
-        dest="neon_branch_name_prefix",
-        help="Prefix for branch names to identify source (first 15 chars used)",
-    )
 
     # INI file settings (pytest.ini, pyproject.toml, etc.)
     parser.addini("neon_api_key", "Neon API key", default=None)
@@ -187,11 +205,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "neon_env_var",
         "Environment variable for connection string",
         default="DATABASE_URL",
-    )
-    parser.addini(
-        "neon_branch_name_prefix",
-        "Prefix for branch names to identify source (first 15 chars used)",
-        default=None,
     )
 
 
@@ -276,12 +289,6 @@ def _create_neon_branch(
     env_var_name = _get_config_value(
         config, "neon_env_var", "", "neon_env_var", "DATABASE_URL"
     )
-    branch_name_prefix = _get_config_value(
-        config,
-        "neon_branch_name_prefix",
-        "NEON_BRANCH_NAME_PREFIX",
-        "neon_branch_name_prefix",
-    )
 
     if not api_key:
         pytest.skip(
@@ -296,13 +303,14 @@ def _create_neon_branch(
     neon = NeonAPI(api_key=api_key)
 
     # Generate unique branch name
-    # Format: pytest-[prefix (first 15 chars)]-[random]-[suffix]
-    # This helps identify orphaned branches when prefix is provided
+    # Format: pytest-[git branch (first 15 chars)]-[random]-[suffix]
+    # This helps identify orphaned branches by showing which git branch created them
     random_suffix = os.urandom(2).hex()  # 2 bytes = 4 hex chars
-    if branch_name_prefix:
-        # Truncate prefix to 15 chars to keep branch names reasonable
-        truncated_prefix = branch_name_prefix[:15]
-        branch_name = f"pytest-{truncated_prefix}-{random_suffix}{branch_name_suffix}"
+    git_branch = _get_git_branch_name()
+    if git_branch:
+        # Truncate git branch to 15 chars to keep branch names reasonable
+        truncated_git_branch = git_branch[:15]
+        branch_name = f"pytest-{truncated_git_branch}-{random_suffix}{branch_name_suffix}"
     else:
         branch_name = f"pytest-{random_suffix}{branch_name_suffix}"
 
