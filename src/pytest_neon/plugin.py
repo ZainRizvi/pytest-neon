@@ -67,6 +67,50 @@ def _get_xdist_worker_id() -> str:
     return os.environ.get("PYTEST_XDIST_WORKER", "main")
 
 
+def _sanitize_branch_name(name: str) -> str:
+    """
+    Sanitize a string for use in Neon branch names.
+
+    Only allows alphanumeric characters, hyphens, and underscores.
+    All other characters (including non-ASCII) are replaced with hyphens.
+    """
+    import re
+
+    # Replace anything that's not alphanumeric, hyphen, or underscore with hyphen
+    sanitized = re.sub(r"[^a-zA-Z0-9_-]", "-", name)
+    # Collapse multiple hyphens into one
+    sanitized = re.sub(r"-+", "-", sanitized)
+    # Remove leading/trailing hyphens
+    sanitized = sanitized.strip("-")
+    return sanitized
+
+
+def _get_git_branch_name() -> str | None:
+    """
+    Get the current git branch name (sanitized), or None if not in a git repo.
+
+    Used to include the git branch in Neon branch names, making it easier
+    to identify which git branch/PR created orphaned test branches.
+
+    The branch name is sanitized to replace special characters with hyphens.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            branch = result.stdout.strip()
+            return _sanitize_branch_name(branch) if branch else None
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
+
+
 def _get_schema_fingerprint(connection_string: str) -> tuple[tuple[Any, ...], ...]:
     """
     Get a fingerprint of the database schema for change detection.
@@ -308,7 +352,16 @@ def _create_neon_branch(
         config._neon_default_branch_id = _get_default_branch_id(neon, project_id)  # type: ignore[attr-defined]
 
     # Generate unique branch name
-    branch_name = f"pytest-{os.urandom(4).hex()}{branch_name_suffix}"
+    # Format: pytest-[git branch (first 15 chars)]-[random]-[suffix]
+    # This helps identify orphaned branches by showing which git branch created them
+    random_suffix = os.urandom(2).hex()  # 2 bytes = 4 hex chars
+    git_branch = _get_git_branch_name()
+    if git_branch:
+        # Truncate git branch to 15 chars to keep branch names reasonable
+        git_prefix = git_branch[:15]
+        branch_name = f"pytest-{git_prefix}-{random_suffix}{branch_name_suffix}"
+    else:
+        branch_name = f"pytest-{random_suffix}{branch_name_suffix}"
 
     # Build branch creation payload
     branch_config: dict[str, Any] = {"name": branch_name}
