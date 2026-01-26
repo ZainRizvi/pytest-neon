@@ -81,15 +81,9 @@ Tests in `tests/` use `pytester` for testing pytest plugins. The plugin itself c
 
 ## Publishing
 
-Use the GitHub Actions release workflow:
+**Always use the GitHub Actions release workflow** - do not manually bump versions:
 1. Go to Actions → Release → Run workflow
 2. Choose patch/minor/major
 3. Workflow bumps version, commits, tags, and publishes to PyPI
-
-Or manually:
-```bash
-uv build
-uv publish --token $PYPI_TOKEN
-```
 
 Package name on PyPI: `pytest-neon`
