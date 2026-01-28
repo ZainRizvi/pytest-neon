@@ -92,13 +92,16 @@ jobs:
           # Update __init__.py
           sed -i "s/__version__ = \".*\"/__version__ = \"$new_version\"/" src/pytest_neon/__init__.py
 
+          # Update uv.lock to reflect new version
+          uv lock
+
       - name: Commit version bump
         env:
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml src/pytest_neon/__init__.py
+          git add pyproject.toml src/pytest_neon/__init__.py uv.lock
           git commit -m "Release v$VERSION"
           git tag "v$VERSION"
           git push origin main --tags
