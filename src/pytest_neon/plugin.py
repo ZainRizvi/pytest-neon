@@ -865,9 +865,11 @@ def _neon_migration_branch(
         root_tmp_dir = tmp_path_factory.getbasetemp().parent
         cache_file = root_tmp_dir / "neon_migration_branch.json"
         lock_file = root_tmp_dir / "neon_migration_branch.lock"
+        migrations_done_file = root_tmp_dir / "neon_migrations_done"
     else:
         cache_file = None
         lock_file = None
+        migrations_done_file = None
 
     is_creator = False
     branch: NeonBranch
@@ -876,6 +878,7 @@ def _neon_migration_branch(
 
     if is_xdist:
         assert cache_file is not None and lock_file is not None
+        assert migrations_done_file is not None
         with FileLock(str(lock_file)):
             if cache_file.exists():
                 # Another worker already created the branch - reuse it
@@ -916,6 +919,22 @@ def _neon_migration_branch(
                         }
                     )
                 )
+
+        # Non-creator workers must wait for migrations to complete BEFORE
+        # neon_apply_migrations runs, otherwise they'll try to run migrations
+        # concurrently on the same branch, causing race conditions.
+        if not is_creator:
+            waited = 0.0
+            poll_interval = 0.5
+            while not migrations_done_file.exists():
+                if waited >= _MIGRATION_WAIT_TIMEOUT:
+                    raise RuntimeError(
+                        f"Timeout waiting for migrations to complete after "
+                        f"{_MIGRATION_WAIT_TIMEOUT}s. The creator worker may have "
+                        f"failed or is still running migrations."
+                    )
+                time.sleep(poll_interval)
+                waited += poll_interval
     else:
         # Not using xdist - create branch normally
         is_creator = True
@@ -932,6 +951,8 @@ def _neon_migration_branch(
 
     # Mark whether this worker is the creator (used by neon_apply_migrations)
     config._neon_is_migration_creator = is_creator  # type: ignore[attr-defined]
+    # Store migrations_done_file path for signaling after migrations complete
+    config._neon_migrations_done_file = migrations_done_file  # type: ignore[attr-defined]
 
     try:
         yield branch
@@ -1007,7 +1028,6 @@ def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> Any:
 @pytest.fixture(scope="session")
 def _neon_migrations_synchronized(
     request: pytest.FixtureRequest,
-    tmp_path_factory: pytest.TempPathFactory,
     _neon_migration_branch: NeonBranch,
     neon_apply_migrations: Any,
 ) -> Any:
@@ -1015,49 +1035,24 @@ def _neon_migrations_synchronized(
     Internal fixture that synchronizes migrations across xdist workers.
 
     This fixture ensures that:
-    1. Only the creator worker runs migrations
-    2. Other workers wait for migrations to complete before proceeding
+    1. Only the creator worker runs migrations (non-creators wait in
+       _neon_migration_branch BEFORE neon_apply_migrations runs)
+    2. Creator signals completion after migrations finish
     3. The return value from neon_apply_migrations is preserved for detection
 
     Without xdist, this is a simple passthrough.
     """
     config = request.config
-    worker_id = _get_xdist_worker_id()
-    is_xdist = worker_id != "main"
     is_creator = getattr(config, "_neon_is_migration_creator", True)
+    migrations_done_file = getattr(config, "_neon_migrations_done_file", None)
 
-    if not is_xdist:
-        # Not using xdist - migrations already ran, just return the value
-        return neon_apply_migrations
-
-    # For xdist, use a signal file to coordinate
-    root_tmp_dir = tmp_path_factory.getbasetemp().parent
-    migrations_done_file = root_tmp_dir / "neon_migrations_done"
-    migrations_lock_file = root_tmp_dir / "neon_migrations.lock"
-
-    if is_creator:
+    if is_creator and migrations_done_file is not None:
         # Creator: migrations just ran via neon_apply_migrations dependency
-        # Signal completion to other workers
-        with FileLock(str(migrations_lock_file)):
-            migrations_done_file.write_text("done")
-        return neon_apply_migrations
-    else:
-        # Non-creator: wait for migrations to complete
-        # The neon_apply_migrations fixture still runs but on already-migrated DB
-        # (most migration tools handle this gracefully as a no-op)
-        waited = 0.0
-        poll_interval = 0.5
-        while not migrations_done_file.exists():
-            if waited >= _MIGRATION_WAIT_TIMEOUT:
-                raise RuntimeError(
-                    f"Timeout waiting for migrations to complete after "
-                    f"{_MIGRATION_WAIT_TIMEOUT}s. The creator worker may have "
-                    f"failed or is still running migrations."
-                )
-            time.sleep(poll_interval)
-            waited += poll_interval
+        # Signal completion to other workers (who are waiting in
+        # _neon_migration_branch)
+        migrations_done_file.write_text("done")
 
-        return neon_apply_migrations
+    return neon_apply_migrations
 
 
 @pytest.fixture(scope="session")
@@ -1287,7 +1282,7 @@ def neon_branch(
 def neon_branch_shared(
     request: pytest.FixtureRequest,
     _neon_migration_branch: NeonBranch,
-    neon_apply_migrations: None,  # Ensures migrations run first
+    _neon_migrations_synchronized: Any,  # Ensures migrations complete first
 ) -> Generator[NeonBranch, None, None]:
     """
     Provide a shared Neon database branch for all tests in a module.
