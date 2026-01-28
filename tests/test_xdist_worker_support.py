@@ -1,5 +1,54 @@
 """Tests for pytest-xdist parallel worker support."""
 
+import json
+
+from pytest_neon.plugin import (
+    NeonBranch,
+    _branch_to_dict,
+    _dict_to_branch,
+)
+
+
+class TestBranchSerialization:
+    """Test NeonBranch serialization for cache file."""
+
+    def test_branch_round_trip(self):
+        """Test that branch can be serialized and deserialized."""
+        branch = NeonBranch(
+            branch_id="br-test-123",
+            project_id="proj-abc",
+            connection_string="postgresql://user:pass@host/db",
+            host="host.neon.tech",
+            parent_id="br-parent-456",
+        )
+
+        data = _branch_to_dict(branch)
+        restored = _dict_to_branch(data)
+
+        assert restored.branch_id == branch.branch_id
+        assert restored.project_id == branch.project_id
+        assert restored.connection_string == branch.connection_string
+        assert restored.host == branch.host
+        assert restored.parent_id == branch.parent_id
+
+    def test_branch_to_dict_is_json_serializable(self):
+        """Test that branch dict can be JSON serialized."""
+        branch = NeonBranch(
+            branch_id="br-test-123",
+            project_id="proj-abc",
+            connection_string="postgresql://user:pass@host/db",
+            host="host.neon.tech",
+            parent_id=None,
+        )
+
+        data = _branch_to_dict(branch)
+        json_str = json.dumps(data)
+        restored_data = json.loads(json_str)
+        restored = _dict_to_branch(restored_data)
+
+        assert restored.branch_id == branch.branch_id
+        assert restored.parent_id is None
+
 
 class TestXdistBranchIsolation:
     """Test that parallel workers get separate branches."""

@@ -36,17 +36,19 @@ For full documentation, see: https://github.com/ZainRizvi/pytest-neon
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import random
 import time
 import warnings
 from collections.abc import Callable, Generator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, TypeVar
 
 import pytest
 import requests
+from filelock import FileLock
 from neon_api import NeonAPI
 from neon_api.exceptions import NeonAPIError
 from neon_api.schema import EndpointState
@@ -806,9 +808,24 @@ def _wait_for_operations(
         )
 
 
+def _branch_to_dict(branch: NeonBranch) -> dict[str, Any]:
+    """Convert NeonBranch to a JSON-serializable dict."""
+    return asdict(branch)
+
+
+def _dict_to_branch(data: dict[str, Any]) -> NeonBranch:
+    """Convert a dict back to NeonBranch."""
+    return NeonBranch(**data)
+
+
+# Timeout for waiting for migrations to complete (seconds)
+_MIGRATION_WAIT_TIMEOUT = 300  # 5 minutes
+
+
 @pytest.fixture(scope="session")
 def _neon_migration_branch(
     request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
 ) -> Generator[NeonBranch, None, None]:
     """
     Session-scoped branch where migrations are applied.
@@ -816,6 +833,13 @@ def _neon_migration_branch(
     This branch is created from the configured parent and serves as
     the parent for all test branches. Migrations run once per session
     on this branch.
+
+    pytest-xdist Support:
+        When running with pytest-xdist, the first worker to acquire the lock
+        creates the migration branch. Other workers wait for migrations to
+        complete, then reuse the same branch. This avoids redundant API calls
+        and ensures migrations only run once. Only the creator cleans up the
+        branch at session end.
 
     Note: The migration branch cannot have an expiry because Neon doesn't
     allow creating child branches from branches with expiration dates.
@@ -826,25 +850,102 @@ def _neon_migration_branch(
         it on request.config. After migrations run, _neon_branch_for_reset
         compares the fingerprint to detect if the schema actually changed.
     """
-    # No expiry - Neon doesn't allow children from branches with expiry
-    branch_gen = _create_neon_branch(
-        request,
-        branch_expiry_override=0,
-        branch_name_suffix="-migrated",
-    )
-    branch = next(branch_gen)
+    config = request.config
+    worker_id = _get_xdist_worker_id()
+    is_xdist = worker_id != "main"
 
-    # Capture schema fingerprint BEFORE migrations run
-    # This is stored on config so _neon_branch_for_reset can compare after
-    pre_migration_fingerprint = _get_schema_fingerprint(branch.connection_string)
-    request.config._neon_pre_migration_fingerprint = pre_migration_fingerprint  # type: ignore[attr-defined]
+    # Get env var name for DATABASE_URL
+    env_var_name = _get_config_value(
+        config, "neon_env_var", "", "neon_env_var", "DATABASE_URL"
+    )
+
+    # For xdist, use shared temp directory and filelock
+    # tmp_path_factory.getbasetemp().parent is shared across all workers
+    if is_xdist:
+        root_tmp_dir = tmp_path_factory.getbasetemp().parent
+        cache_file = root_tmp_dir / "neon_migration_branch.json"
+        lock_file = root_tmp_dir / "neon_migration_branch.lock"
+    else:
+        cache_file = None
+        lock_file = None
+
+    is_creator = False
+    branch: NeonBranch
+    branch_gen: Generator[NeonBranch, None, None] | None = None
+    original_env_value: str | None = None
+
+    if is_xdist:
+        assert cache_file is not None and lock_file is not None
+        with FileLock(str(lock_file)):
+            if cache_file.exists():
+                # Another worker already created the branch - reuse it
+                data = json.loads(cache_file.read_text())
+                branch = _dict_to_branch(data["branch"])
+                pre_migration_fingerprint = tuple(
+                    tuple(row) for row in data["pre_migration_fingerprint"]
+                )
+                config._neon_pre_migration_fingerprint = pre_migration_fingerprint  # type: ignore[attr-defined]
+
+                # Set DATABASE_URL for this worker (not done by _create_neon_branch)
+                original_env_value = os.environ.get(env_var_name)
+                os.environ[env_var_name] = branch.connection_string
+            else:
+                # First worker - create branch and cache it
+                is_creator = True
+                branch_gen = _create_neon_branch(
+                    request,
+                    branch_expiry_override=0,
+                    branch_name_suffix="-migrated",
+                )
+                branch = next(branch_gen)
+
+                # Capture schema fingerprint BEFORE migrations run
+                pre_migration_fingerprint = _get_schema_fingerprint(
+                    branch.connection_string
+                )
+                config._neon_pre_migration_fingerprint = pre_migration_fingerprint  # type: ignore[attr-defined]
+
+                # Cache for other workers (they'll read this after lock released)
+                # Note: We cache now with pre-migration fingerprint. The branch
+                # content will have migrations applied by neon_apply_migrations.
+                cache_file.write_text(
+                    json.dumps(
+                        {
+                            "branch": _branch_to_dict(branch),
+                            "pre_migration_fingerprint": pre_migration_fingerprint,
+                        }
+                    )
+                )
+    else:
+        # Not using xdist - create branch normally
+        is_creator = True
+        branch_gen = _create_neon_branch(
+            request,
+            branch_expiry_override=0,
+            branch_name_suffix="-migrated",
+        )
+        branch = next(branch_gen)
+
+        # Capture schema fingerprint BEFORE migrations run
+        pre_migration_fingerprint = _get_schema_fingerprint(branch.connection_string)
+        config._neon_pre_migration_fingerprint = pre_migration_fingerprint  # type: ignore[attr-defined]
+
+    # Mark whether this worker is the creator (used by neon_apply_migrations)
+    config._neon_is_migration_creator = is_creator  # type: ignore[attr-defined]
 
     try:
         yield branch
     finally:
-        # Clean up by exhausting the generator (triggers branch deletion)
-        with contextlib.suppress(StopIteration):
-            next(branch_gen)
+        # Restore env var if we set it (non-creator workers)
+        if original_env_value is not None:
+            os.environ[env_var_name] = original_env_value
+        elif not is_creator and env_var_name in os.environ:
+            os.environ.pop(env_var_name, None)
+
+        # Only the creator cleans up the branch
+        if is_creator and branch_gen is not None:
+            with contextlib.suppress(StopIteration):
+                next(branch_gen)
 
 
 @pytest.fixture(scope="session")
@@ -854,6 +955,12 @@ def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> Any:
 
     The migration branch is already created and DATABASE_URL is set.
     Migrations run once per test session, before any tests execute.
+
+    pytest-xdist Support:
+        When running with pytest-xdist, migrations only run on the first
+        worker (the one that created the migration branch). Other workers
+        wait for migrations to complete before proceeding. This ensures
+        migrations run exactly once, even with parallel workers.
 
     Smart Migration Detection:
         The plugin automatically detects whether migrations actually modified
@@ -898,10 +1005,66 @@ def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> Any:
 
 
 @pytest.fixture(scope="session")
+def _neon_migrations_synchronized(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    _neon_migration_branch: NeonBranch,
+    neon_apply_migrations: Any,
+) -> Any:
+    """
+    Internal fixture that synchronizes migrations across xdist workers.
+
+    This fixture ensures that:
+    1. Only the creator worker runs migrations
+    2. Other workers wait for migrations to complete before proceeding
+    3. The return value from neon_apply_migrations is preserved for detection
+
+    Without xdist, this is a simple passthrough.
+    """
+    config = request.config
+    worker_id = _get_xdist_worker_id()
+    is_xdist = worker_id != "main"
+    is_creator = getattr(config, "_neon_is_migration_creator", True)
+
+    if not is_xdist:
+        # Not using xdist - migrations already ran, just return the value
+        return neon_apply_migrations
+
+    # For xdist, use a signal file to coordinate
+    root_tmp_dir = tmp_path_factory.getbasetemp().parent
+    migrations_done_file = root_tmp_dir / "neon_migrations_done"
+    migrations_lock_file = root_tmp_dir / "neon_migrations.lock"
+
+    if is_creator:
+        # Creator: migrations just ran via neon_apply_migrations dependency
+        # Signal completion to other workers
+        with FileLock(str(migrations_lock_file)):
+            migrations_done_file.write_text("done")
+        return neon_apply_migrations
+    else:
+        # Non-creator: wait for migrations to complete
+        # The neon_apply_migrations fixture still runs but on already-migrated DB
+        # (most migration tools handle this gracefully as a no-op)
+        waited = 0.0
+        poll_interval = 0.5
+        while not migrations_done_file.exists():
+            if waited >= _MIGRATION_WAIT_TIMEOUT:
+                raise RuntimeError(
+                    f"Timeout waiting for migrations to complete after "
+                    f"{_MIGRATION_WAIT_TIMEOUT}s. The creator worker may have "
+                    f"failed or is still running migrations."
+                )
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+        return neon_apply_migrations
+
+
+@pytest.fixture(scope="session")
 def _neon_branch_for_reset(
     request: pytest.FixtureRequest,
     _neon_migration_branch: NeonBranch,
-    neon_apply_migrations: Any,  # Ensures migrations run first; value for detection
+    _neon_migrations_synchronized: Any,  # Ensures migrations complete; for detection
 ) -> Generator[NeonBranch, None, None]:
     """
     Internal fixture that creates a test branch from the migration branch.
@@ -931,7 +1094,8 @@ def _neon_branch_for_reset(
         - Migrations exist but are already applied (no schema changes)
     """
     # Check if migrations fixture was overridden
-    migrations_defined = neon_apply_migrations is not _MIGRATIONS_NOT_DEFINED
+    # _neon_migrations_synchronized passes through the neon_apply_migrations value
+    migrations_defined = _neon_migrations_synchronized is not _MIGRATIONS_NOT_DEFINED
 
     # Check if schema actually changed (if we have a pre-migration fingerprint)
     pre_fingerprint = getattr(request.config, "_neon_pre_migration_fingerprint", ())
