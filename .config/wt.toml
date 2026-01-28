@@ -1,0 +1,4 @@
+# Worktrunk project configuration for pytest-neon
+
+# Create fresh uv venv and install all dependencies when creating worktrees
+post-create = "uv venv && uv sync --all-extras"
