@@ -5,7 +5,7 @@ class TestDirtyFixture:
     """Test neon_branch_dirty fixture behavior."""
 
     def test_dirty_is_session_scoped(self, pytester):
-        """Verify that neon_branch_dirty is session-scoped (same branch across tests)."""
+        """Verify neon_branch_dirty is session-scoped (same branch across tests)."""
         pytester.makeconftest(
             """
             import os
@@ -165,7 +165,9 @@ class TestIsolatedFixture:
                 return None
 
             @pytest.fixture(scope="function")
-            def neon_branch_isolated(request, _neon_migration_branch, _neon_migrations_synchronized):
+            def neon_branch_isolated(
+                request, _neon_migration_branch, _neon_migrations_synchronized
+            ):
                 # Simulate creating a new branch per test
                 branch_counter[0] += 1
                 branch_id = f"br-isolated-{branch_counter[0]}"
@@ -187,8 +189,12 @@ class TestIsolatedFixture:
 
             def pytest_sessionfinish(session, exitstatus):
                 # Verify each test got a unique branch
-                assert len(branch_ids) == 3, f"Expected 3 branches, got {len(branch_ids)}"
-                assert len(set(branch_ids)) == 3, f"Branches should be unique: {branch_ids}"
+                assert len(branch_ids) == 3, (
+                    f"Expected 3 branches, got {len(branch_ids)}"
+                )
+                assert len(set(branch_ids)) == 3, (
+                    f"Branches should be unique: {branch_ids}"
+                )
         """
         )
 
@@ -245,7 +251,9 @@ class TestIsolatedFixture:
                 return None
 
             @pytest.fixture(scope="function")
-            def neon_branch_isolated(request, _neon_migration_branch, _neon_migrations_synchronized):
+            def neon_branch_isolated(
+                request, _neon_migration_branch, _neon_migrations_synchronized
+            ):
                 # Store original
                 original = os.environ.get("DATABASE_URL")
 
@@ -344,7 +352,9 @@ class TestDirtyAndIsolatedTogether:
                 return _neon_branch_for_reset
 
             @pytest.fixture(scope="function")
-            def neon_branch_isolated(request, _neon_migration_branch, _neon_migrations_synchronized):
+            def neon_branch_isolated(
+                request, _neon_migration_branch, _neon_migrations_synchronized
+            ):
                 branch_counter[0] += 1
                 branch = FakeNeonBranch(
                     branch_id=f"br-isolated-{branch_counter[0]}",
