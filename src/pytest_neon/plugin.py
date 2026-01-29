@@ -588,9 +588,7 @@ class NeonBranchManager:
 
         _reset_branch_to_parent(branch, self.config.api_key)
 
-    def _wait_for_endpoint(
-        self, endpoint_id: str, max_wait_seconds: float = 60
-    ) -> str:
+    def _wait_for_endpoint(self, endpoint_id: str, max_wait_seconds: float = 60) -> str:
         """Wait for endpoint to become active and return its host."""
         poll_interval = 0.5
         waited = 0.0
@@ -1833,9 +1831,7 @@ def neon_branch_isolated(
     yield _neon_isolated_branch
 
     # Reset branch to migration state after each test
-    branch_manager = getattr(
-        request.config, "_neon_isolated_branch_manager", None
-    )
+    branch_manager = getattr(request.config, "_neon_isolated_branch_manager", None)
     if branch_manager is not None:
         try:
             branch_manager.reset_branch(_neon_isolated_branch)
