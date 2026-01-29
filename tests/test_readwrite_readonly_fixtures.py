@@ -1,6 +1,71 @@
 """Tests for neon_branch_readwrite and neon_branch_readonly fixtures."""
 
 
+class TestReadonlySessionScoped:
+    """Test that neon_branch_readonly is session-scoped."""
+
+    def test_readonly_is_session_scoped(self, pytester):
+        """Verify that neon_branch_readonly is session-scoped (same instance across tests)."""
+        pytester.makeconftest(
+            """
+            import os
+            import pytest
+            from dataclasses import dataclass
+
+            instance_ids = []
+
+            @dataclass
+            class FakeNeonBranch:
+                branch_id: str
+                project_id: str
+                connection_string: str
+                host: str
+                parent_id: str
+
+            @pytest.fixture(scope="session")
+            def _neon_readonly_endpoint():
+                branch = FakeNeonBranch(
+                    branch_id="br-readonly",
+                    project_id="proj-test",
+                    connection_string="postgresql://readonly",
+                    host="readonly.neon.tech",
+                    parent_id="br-migration",
+                )
+                yield branch
+
+            @pytest.fixture(scope="session")
+            def neon_branch_readonly(_neon_readonly_endpoint):
+                return _neon_readonly_endpoint
+
+            @pytest.fixture
+            def track_readonly_instance(neon_branch_readonly):
+                instance_ids.append(id(neon_branch_readonly))
+                return neon_branch_readonly
+
+            def pytest_sessionfinish(session, exitstatus):
+                # Verify same instance was used across all tests
+                assert len(instance_ids) == 3, f"Expected 3 tests, got {len(instance_ids)}"
+                assert len(set(instance_ids)) == 1, f"Expected same instance, got {len(set(instance_ids))} different"
+        """
+        )
+
+        pytester.makepyfile(
+            """
+            def test_first(track_readonly_instance):
+                assert track_readonly_instance.branch_id == "br-readonly"
+
+            def test_second(track_readonly_instance):
+                assert track_readonly_instance.branch_id == "br-readonly"
+
+            def test_third(track_readonly_instance):
+                assert track_readonly_instance.branch_id == "br-readonly"
+        """
+        )
+
+        result = pytester.runpytest("-v")
+        result.assert_outcomes(passed=3)
+
+
 class TestReadwriteFixture:
     """Test neon_branch_readwrite fixture behavior."""
 
@@ -124,8 +189,66 @@ class TestReadonlyFixture:
         result.assert_outcomes(passed=2)
 
 
-class TestDeprecatedNeonBranch:
-    """Test that neon_branch emits deprecation warning."""
+class TestDeprecatedFixtures:
+    """Test that deprecated fixtures emit deprecation warnings."""
+
+    def test_neon_branch_readwrite_emits_deprecation_warning(self, pytester):
+        """Verify that using neon_branch_readwrite emits a deprecation warning."""
+        pytester.makeconftest(
+            """
+            import os
+            import pytest
+            import warnings
+            from dataclasses import dataclass
+
+            @dataclass
+            class FakeNeonBranch:
+                branch_id: str
+                project_id: str
+                connection_string: str
+                host: str
+                parent_id: str
+
+            @pytest.fixture(scope="session")
+            def _neon_isolated_branch():
+                branch = FakeNeonBranch(
+                    branch_id="br-test",
+                    project_id="proj-test",
+                    connection_string="postgresql://test",
+                    host="test.neon.tech",
+                    parent_id="br-parent",
+                )
+                os.environ["DATABASE_URL"] = branch.connection_string
+                try:
+                    yield branch
+                finally:
+                    os.environ.pop("DATABASE_URL", None)
+
+            @pytest.fixture(scope="function")
+            def neon_branch_isolated(_neon_isolated_branch):
+                yield _neon_isolated_branch
+
+            @pytest.fixture(scope="function")
+            def neon_branch_readwrite(neon_branch_isolated):
+                warnings.warn(
+                    "neon_branch_readwrite is deprecated. Use neon_branch_isolated.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                yield neon_branch_isolated
+        """
+        )
+
+        pytester.makepyfile(
+            """
+            def test_deprecated(neon_branch_readwrite):
+                assert neon_branch_readwrite.branch_id == "br-test"
+        """
+        )
+
+        result = pytester.runpytest("-v", "-W", "error::DeprecationWarning")
+        # Should error during fixture setup (deprecation warning treated as error)
+        result.assert_outcomes(errors=1)
 
     def test_neon_branch_emits_deprecation_warning(self, pytester):
         """Verify that using neon_branch emits a deprecation warning."""

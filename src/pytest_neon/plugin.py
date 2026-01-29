@@ -1,30 +1,44 @@
 """Pytest plugin providing Neon database branch fixtures.
 
-This plugin provides fixtures for isolated database testing using Neon's
-instant branching feature. Each test gets a clean database state via
-branch reset after each test.
+This plugin provides fixtures for database testing using Neon's instant
+branching feature. Multiple isolation levels are available:
 
 Main fixtures:
-    neon_branch_readwrite: Read-write access with reset after each test (recommended)
-    neon_branch_readonly: Read-only access, no reset (fastest for read-only tests)
-    neon_branch: Deprecated alias for neon_branch_readwrite
+    neon_branch_readonly: True read-only access via read_only endpoint (enforced)
+    neon_branch_dirty: Session-scoped read-write, shared state across all tests
+    neon_branch_isolated: Per-worker branch with reset after each test (recommended)
+    neon_branch_readwrite: Deprecated, use neon_branch_isolated instead
+    neon_branch: Deprecated alias for neon_branch_isolated
     neon_branch_shared: Shared branch without reset (module-scoped)
+
+Connection fixtures (require extras):
     neon_connection: psycopg2 connection (requires psycopg2 extra)
     neon_connection_psycopg: psycopg v3 connection (requires psycopg extra)
     neon_engine: SQLAlchemy engine (requires sqlalchemy extra)
 
+Architecture:
+    Parent Branch (configured or project default)
+        └── Migration Branch (session-scoped, read_write endpoint)
+                │   ↑ migrations run here ONCE
+                │
+                ├── Read-only Endpoint (read_only endpoint ON migration branch)
+                │       ↑ neon_branch_readonly uses this
+                │
+                ├── Dirty Branch (session-scoped child, shared across ALL workers)
+                │       ↑ neon_branch_dirty uses this
+                │
+                └── Isolated Branch (one per xdist worker, lazily created)
+                        ↑ neon_branch_isolated uses this, reset after each test
+
 SQLAlchemy Users:
     If you create your own SQLAlchemy engine (not using neon_engine fixture),
-    you MUST use pool_pre_ping=True when using neon_branch_readwrite:
+    you MUST use pool_pre_ping=True when using neon_branch_isolated:
 
         engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
     This is required because branch resets terminate server-side connections.
     Without pool_pre_ping, SQLAlchemy may try to reuse dead pooled connections,
     causing "SSL connection has been closed unexpectedly" errors.
-
-    Note: pool_pre_ping is not required for neon_branch_readonly since no
-    resets occur.
 
 Configuration:
     Set NEON_API_KEY and NEON_PROJECT_ID environment variables, or use
@@ -322,6 +336,417 @@ class NeonBranch:
     connection_string: str
     host: str
     parent_id: str | None = None
+    endpoint_id: str | None = None
+
+
+@dataclass
+class NeonConfig:
+    """Configuration for Neon operations. Extracted from pytest config."""
+
+    api_key: str
+    project_id: str
+    parent_branch_id: str | None
+    database_name: str
+    role_name: str
+    keep_branches: bool
+    branch_expiry: int
+    env_var_name: str
+
+    @classmethod
+    def from_pytest_config(cls, config: pytest.Config) -> "NeonConfig | None":
+        """
+        Extract NeonConfig from pytest configuration.
+
+        Returns None if required values (api_key, project_id) are missing,
+        allowing callers to skip tests gracefully.
+        """
+        api_key = _get_config_value(
+            config, "neon_api_key", "NEON_API_KEY", "neon_api_key"
+        )
+        project_id = _get_config_value(
+            config, "neon_project_id", "NEON_PROJECT_ID", "neon_project_id"
+        )
+
+        if not api_key or not project_id:
+            return None
+
+        parent_branch_id = _get_config_value(
+            config, "neon_parent_branch", "NEON_PARENT_BRANCH_ID", "neon_parent_branch"
+        )
+        database_name = _get_config_value(
+            config, "neon_database", "NEON_DATABASE", "neon_database", "neondb"
+        )
+        role_name = _get_config_value(
+            config, "neon_role", "NEON_ROLE", "neon_role", "neondb_owner"
+        )
+
+        keep_branches = config.getoption("neon_keep_branches", default=None)
+        if keep_branches is None:
+            keep_branches = config.getini("neon_keep_branches")
+
+        branch_expiry = config.getoption("neon_branch_expiry", default=None)
+        if branch_expiry is None:
+            branch_expiry = int(config.getini("neon_branch_expiry"))
+
+        env_var_name = _get_config_value(
+            config, "neon_env_var", "", "neon_env_var", "DATABASE_URL"
+        )
+
+        return cls(
+            api_key=api_key,
+            project_id=project_id,
+            parent_branch_id=parent_branch_id,
+            database_name=database_name or "neondb",
+            role_name=role_name or "neondb_owner",
+            keep_branches=bool(keep_branches),
+            branch_expiry=branch_expiry or DEFAULT_BRANCH_EXPIRY_SECONDS,
+            env_var_name=env_var_name or "DATABASE_URL",
+        )
+
+
+class NeonBranchManager:
+    """
+    Manages Neon branch lifecycle operations.
+
+    This class encapsulates all Neon API interactions for branch management,
+    making it easier to test and reason about branch operations.
+    """
+
+    def __init__(self, config: NeonConfig):
+        self.config = config
+        self._neon = NeonAPI(api_key=config.api_key)
+        self._default_branch_id: str | None = None
+        self._default_branch_id_fetched = False
+
+    def get_default_branch_id(self) -> str | None:
+        """Get the default/primary branch ID (cached)."""
+        if not self._default_branch_id_fetched:
+            self._default_branch_id = _get_default_branch_id(
+                self._neon, self.config.project_id
+            )
+            self._default_branch_id_fetched = True
+        return self._default_branch_id
+
+    def create_branch(
+        self,
+        name_suffix: str = "",
+        parent_branch_id: str | None = None,
+        expiry_seconds: int | None = None,
+    ) -> NeonBranch:
+        """
+        Create a new Neon branch with a read_write endpoint.
+
+        Args:
+            name_suffix: Suffix to add to branch name (e.g., "-migration", "-dirty")
+            parent_branch_id: Parent branch ID (defaults to config's parent or project default)
+            expiry_seconds: Branch expiry in seconds (0 or None for no expiry)
+
+        Returns:
+            NeonBranch with connection details
+        """
+        parent_id = parent_branch_id or self.config.parent_branch_id
+
+        # Generate unique branch name
+        random_suffix = os.urandom(2).hex()
+        git_branch = _get_git_branch_name()
+        if git_branch:
+            git_prefix = git_branch[:15]
+            branch_name = f"pytest-{git_prefix}-{random_suffix}{name_suffix}"
+        else:
+            branch_name = f"pytest-{random_suffix}{name_suffix}"
+
+        # Build branch config
+        branch_config: dict[str, Any] = {"name": branch_name}
+        if parent_id:
+            branch_config["parent_id"] = parent_id
+
+        # Set expiry if specified
+        if expiry_seconds and expiry_seconds > 0:
+            expires_at = datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds)
+            branch_config["expires_at"] = expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Create branch with read_write endpoint
+        result = _retry_on_rate_limit(
+            lambda: self._neon.branch_create(
+                project_id=self.config.project_id,
+                branch=branch_config,
+                endpoints=[{"type": "read_write"}],
+            ),
+            operation_name="branch_create",
+        )
+
+        branch = result.branch
+        endpoint_id = None
+        for op in result.operations:
+            if op.endpoint_id:
+                endpoint_id = op.endpoint_id
+                break
+
+        if not endpoint_id:
+            raise RuntimeError(f"No endpoint created for branch {branch.id}")
+
+        # Wait for endpoint to be active
+        host = self._wait_for_endpoint(endpoint_id)
+
+        # Safety check: never operate on default branch
+        default_branch_id = self.get_default_branch_id()
+        if default_branch_id and branch.id == default_branch_id:
+            raise RuntimeError(
+                f"SAFETY CHECK FAILED: Attempted to operate on default branch "
+                f"{branch.id}. Please report this bug."
+            )
+
+        # Get password
+        connection_string = self._reset_password_and_build_connection_string(
+            branch.id, host
+        )
+
+        return NeonBranch(
+            branch_id=branch.id,
+            project_id=self.config.project_id,
+            connection_string=connection_string,
+            host=host,
+            parent_id=branch.parent_id,
+            endpoint_id=endpoint_id,
+        )
+
+    def create_readonly_endpoint(self, branch: NeonBranch) -> NeonBranch:
+        """
+        Create a read_only endpoint on an existing branch.
+
+        This creates a true read-only endpoint that enforces no writes at the
+        database level.
+
+        Args:
+            branch: The branch to create the endpoint on
+
+        Returns:
+            NeonBranch with the read_only endpoint's connection details
+        """
+        result = _retry_on_rate_limit(
+            lambda: self._neon.endpoint_create(
+                project_id=self.config.project_id,
+                endpoint={
+                    "branch_id": branch.branch_id,
+                    "type": "read_only",
+                },
+            ),
+            operation_name="endpoint_create_readonly",
+        )
+
+        endpoint_id = result.endpoint.id
+        host = self._wait_for_endpoint(endpoint_id)
+
+        # Get password for the read_only endpoint
+        connection_string = self._reset_password_and_build_connection_string(
+            branch.branch_id, host
+        )
+
+        return NeonBranch(
+            branch_id=branch.branch_id,
+            project_id=self.config.project_id,
+            connection_string=connection_string,
+            host=host,
+            parent_id=branch.parent_id,
+            endpoint_id=endpoint_id,
+        )
+
+    def delete_branch(self, branch_id: str) -> None:
+        """Delete a branch (silently ignores errors)."""
+        if self.config.keep_branches:
+            return
+        try:
+            _retry_on_rate_limit(
+                lambda: self._neon.branch_delete(
+                    project_id=self.config.project_id, branch_id=branch_id
+                ),
+                operation_name="branch_delete",
+            )
+        except Exception as e:
+            warnings.warn(f"Failed to delete Neon branch {branch_id}: {e}", stacklevel=2)
+
+    def delete_endpoint(self, endpoint_id: str) -> None:
+        """Delete an endpoint (silently ignores errors)."""
+        try:
+            _retry_on_rate_limit(
+                lambda: self._neon.endpoint_delete(
+                    project_id=self.config.project_id, endpoint_id=endpoint_id
+                ),
+                operation_name="endpoint_delete",
+            )
+        except Exception as e:
+            warnings.warn(
+                f"Failed to delete Neon endpoint {endpoint_id}: {e}", stacklevel=2
+            )
+
+    def reset_branch(self, branch: NeonBranch) -> None:
+        """Reset a branch to its parent's state."""
+        if not branch.parent_id:
+            raise RuntimeError(f"Branch {branch.branch_id} has no parent - cannot reset")
+
+        _reset_branch_to_parent(branch, self.config.api_key)
+
+    def _wait_for_endpoint(
+        self, endpoint_id: str, max_wait_seconds: float = 60
+    ) -> str:
+        """Wait for endpoint to become active and return its host."""
+        poll_interval = 0.5
+        waited = 0.0
+
+        while True:
+            endpoint_response = _retry_on_rate_limit(
+                lambda: self._neon.endpoint(
+                    project_id=self.config.project_id, endpoint_id=endpoint_id
+                ),
+                operation_name="endpoint_status",
+            )
+            endpoint = endpoint_response.endpoint
+            state = endpoint.current_state
+
+            if state == EndpointState.active:
+                return endpoint.host
+
+            if waited >= max_wait_seconds:
+                raise RuntimeError(
+                    f"Timeout waiting for endpoint {endpoint_id} to become active "
+                    f"(current state: {state})"
+                )
+
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+    def _reset_password_and_build_connection_string(
+        self, branch_id: str, host: str
+    ) -> str:
+        """Reset role password and build connection string."""
+        password_response = _retry_on_rate_limit(
+            lambda: self._neon.role_password_reset(
+                project_id=self.config.project_id,
+                branch_id=branch_id,
+                role_name=self.config.role_name,
+            ),
+            operation_name="role_password_reset",
+        )
+        password = password_response.role.password
+
+        return (
+            f"postgresql://{self.config.role_name}:{password}@{host}/"
+            f"{self.config.database_name}?sslmode=require"
+        )
+
+
+class XdistCoordinator:
+    """
+    Coordinates branch sharing across pytest-xdist workers.
+
+    Uses file locks and JSON cache files to ensure only one worker creates
+    shared resources (like the migration branch), while others reuse them.
+    """
+
+    def __init__(self, tmp_path_factory: pytest.TempPathFactory):
+        self.worker_id = _get_xdist_worker_id()
+        self.is_xdist = self.worker_id != "main"
+
+        if self.is_xdist:
+            root_tmp_dir = tmp_path_factory.getbasetemp().parent
+            self._lock_dir = root_tmp_dir
+        else:
+            self._lock_dir = None
+
+    def coordinate_resource(
+        self,
+        resource_name: str,
+        create_fn: Callable[[], dict[str, Any]],
+    ) -> tuple[dict[str, Any], bool]:
+        """
+        Coordinate creation of a shared resource across workers.
+
+        Args:
+            resource_name: Name of the resource (used for cache/lock files)
+            create_fn: Function to create the resource, returns dict to cache
+
+        Returns:
+            Tuple of (cached_data, is_creator)
+        """
+        if not self.is_xdist:
+            return create_fn(), True
+
+        assert self._lock_dir is not None
+        cache_file = self._lock_dir / f"neon_{resource_name}.json"
+        lock_file = self._lock_dir / f"neon_{resource_name}.lock"
+
+        with FileLock(str(lock_file)):
+            if cache_file.exists():
+                data = json.loads(cache_file.read_text())
+                return data, False
+            else:
+                data = create_fn()
+                cache_file.write_text(json.dumps(data))
+                return data, True
+
+    def wait_for_signal(self, signal_name: str, timeout: float = 60) -> None:
+        """Wait for a signal file to be created by another worker."""
+        if not self.is_xdist or self._lock_dir is None:
+            return
+
+        signal_file = self._lock_dir / f"neon_{signal_name}"
+        waited = 0.0
+        poll_interval = 0.5
+
+        while not signal_file.exists():
+            if waited >= timeout:
+                raise RuntimeError(
+                    f"Worker {self.worker_id} timed out waiting for signal "
+                    f"'{signal_name}' after {timeout}s. This usually means the "
+                    f"creator worker failed or is still processing."
+                )
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+    def send_signal(self, signal_name: str) -> None:
+        """Create a signal file for other workers."""
+        if not self.is_xdist or self._lock_dir is None:
+            return
+
+        signal_file = self._lock_dir / f"neon_{signal_name}"
+        signal_file.write_text("done")
+
+
+class EnvironmentManager:
+    """Manages DATABASE_URL environment variable lifecycle."""
+
+    def __init__(self, env_var_name: str = "DATABASE_URL"):
+        self.env_var_name = env_var_name
+        self._original_value: str | None = None
+        self._is_set = False
+
+    def set(self, connection_string: str) -> None:
+        """Set the environment variable, saving original value."""
+        if not self._is_set:
+            self._original_value = os.environ.get(self.env_var_name)
+            self._is_set = True
+        os.environ[self.env_var_name] = connection_string
+
+    def restore(self) -> None:
+        """Restore the original environment variable value."""
+        if not self._is_set:
+            return
+
+        if self._original_value is None:
+            os.environ.pop(self.env_var_name, None)
+        else:
+            os.environ[self.env_var_name] = self._original_value
+
+        self._is_set = False
+
+    @contextlib.contextmanager
+    def temporary(self, connection_string: str) -> Generator[None, None, None]:
+        """Context manager for temporary environment variable."""
+        self.set(connection_string)
+        try:
+            yield
+        finally:
+            self.restore()
 
 
 def _get_default_branch_id(neon: NeonAPI, project_id: str) -> str | None:
@@ -642,6 +1067,7 @@ def _create_neon_branch(
         connection_string=connection_string,
         host=host,
         parent_id=branch.parent_id,
+        endpoint_id=endpoint_id,
     )
 
     # Set DATABASE_URL (or configured env var) for the duration of the fixture scope
@@ -674,6 +1100,113 @@ def _create_neon_branch(
                     f"Failed to delete Neon branch {branch.id}: {e}",
                     stacklevel=2,
                 )
+
+
+def _create_readonly_endpoint(
+    branch: NeonBranch,
+    api_key: str,
+    database_name: str,
+    role_name: str,
+) -> NeonBranch:
+    """
+    Create a read_only endpoint on an existing branch.
+
+    Returns a new NeonBranch object with the read_only endpoint's connection string.
+    The read_only endpoint enforces that no writes can be made through this connection.
+
+    Args:
+        branch: The branch to create a read_only endpoint on
+        api_key: Neon API key
+        database_name: Database name for connection string
+        role_name: Role name for connection string
+
+    Returns:
+        NeonBranch with read_only endpoint connection details
+    """
+    neon = NeonAPI(api_key=api_key)
+
+    # Create read_only endpoint on the branch
+    # See: https://api-docs.neon.tech/reference/createprojectendpoint
+    result = _retry_on_rate_limit(
+        lambda: neon.endpoint_create(
+            project_id=branch.project_id,
+            endpoint={
+                "branch_id": branch.branch_id,
+                "type": "read_only",
+            },
+        ),
+        operation_name="endpoint_create_readonly",
+    )
+
+    endpoint = result.endpoint
+    endpoint_id = endpoint.id
+
+    # Wait for endpoint to be ready
+    max_wait_seconds = 60
+    poll_interval = 0.5
+    waited = 0.0
+
+    while True:
+        endpoint_response = _retry_on_rate_limit(
+            lambda: neon.endpoint(project_id=branch.project_id, endpoint_id=endpoint_id),
+            operation_name="endpoint_status_readonly",
+        )
+        endpoint = endpoint_response.endpoint
+        state = endpoint.current_state
+
+        if state == EndpointState.active:
+            break
+
+        if waited >= max_wait_seconds:
+            raise RuntimeError(
+                f"Timeout waiting for read_only endpoint {endpoint_id} to become active "
+                f"(current state: {state})"
+            )
+
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    host = endpoint.host
+
+    # Reset password to get the password value for this endpoint
+    password_response = _retry_on_rate_limit(
+        lambda: neon.role_password_reset(
+            project_id=branch.project_id,
+            branch_id=branch.branch_id,
+            role_name=role_name,
+        ),
+        operation_name="role_password_reset_readonly",
+    )
+    password = password_response.role.password
+
+    # Build connection string for the read_only endpoint
+    connection_string = (
+        f"postgresql://{role_name}:{password}@{host}/{database_name}?sslmode=require"
+    )
+
+    return NeonBranch(
+        branch_id=branch.branch_id,
+        project_id=branch.project_id,
+        connection_string=connection_string,
+        host=host,
+        parent_id=branch.parent_id,
+        endpoint_id=endpoint_id,
+    )
+
+
+def _delete_endpoint(project_id: str, endpoint_id: str, api_key: str) -> None:
+    """Delete a Neon endpoint."""
+    neon = NeonAPI(api_key=api_key)
+    try:
+        _retry_on_rate_limit(
+            lambda: neon.endpoint_delete(project_id=project_id, endpoint_id=endpoint_id),
+            operation_name="endpoint_delete",
+        )
+    except Exception as e:
+        warnings.warn(
+            f"Failed to delete Neon endpoint {endpoint_id}: {e}",
+            stacklevel=2,
+        )
 
 
 def _reset_branch_to_parent(branch: NeonBranch, api_key: str) -> None:
@@ -823,16 +1356,48 @@ _MIGRATION_WAIT_TIMEOUT = 300  # 5 minutes
 
 
 @pytest.fixture(scope="session")
+def _neon_config(request: pytest.FixtureRequest) -> NeonConfig:
+    """
+    Session-scoped Neon configuration extracted from pytest config.
+
+    Skips tests if required configuration (api_key, project_id) is missing.
+    """
+    config = NeonConfig.from_pytest_config(request.config)
+    if config is None:
+        pytest.skip(
+            "Neon configuration missing. Set NEON_API_KEY and NEON_PROJECT_ID "
+            "environment variables or use --neon-api-key and --neon-project-id."
+        )
+    return config
+
+
+@pytest.fixture(scope="session")
+def _neon_branch_manager(_neon_config: NeonConfig) -> NeonBranchManager:
+    """Session-scoped branch manager for Neon operations."""
+    return NeonBranchManager(_neon_config)
+
+
+@pytest.fixture(scope="session")
+def _neon_xdist_coordinator(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> XdistCoordinator:
+    """Session-scoped coordinator for xdist worker synchronization."""
+    return XdistCoordinator(tmp_path_factory)
+
+
+@pytest.fixture(scope="session")
 def _neon_migration_branch(
     request: pytest.FixtureRequest,
-    tmp_path_factory: pytest.TempPathFactory,
+    _neon_config: NeonConfig,
+    _neon_branch_manager: NeonBranchManager,
+    _neon_xdist_coordinator: XdistCoordinator,
 ) -> Generator[NeonBranch, None, None]:
     """
     Session-scoped branch where migrations are applied.
 
-    This branch is created from the configured parent and serves as
-    the parent for all test branches. Migrations run once per session
-    on this branch.
+    This branch is ALWAYS created from the configured parent and serves as
+    the parent for all test branches (dirty, isolated, readonly endpoint).
+    Migrations run once per session on this branch.
 
     pytest-xdist Support:
         When running with pytest-xdist, the first worker to acquire the lock
@@ -844,129 +1409,43 @@ def _neon_migration_branch(
     Note: The migration branch cannot have an expiry because Neon doesn't
     allow creating child branches from branches with expiration dates.
     Cleanup relies on the fixture teardown at session end.
-
-    Smart Migration Detection:
-        Before yielding, this fixture captures a schema fingerprint and stores
-        it on request.config. After migrations run, _neon_branch_for_reset
-        compares the fingerprint to detect if the schema actually changed.
     """
-    config = request.config
-    worker_id = _get_xdist_worker_id()
-    is_xdist = worker_id != "main"
-
-    # Get env var name for DATABASE_URL
-    env_var_name = _get_config_value(
-        config, "neon_env_var", "", "neon_env_var", "DATABASE_URL"
-    )
-
-    # For xdist, use shared temp directory and filelock
-    # tmp_path_factory.getbasetemp().parent is shared across all workers
-    if is_xdist:
-        root_tmp_dir = tmp_path_factory.getbasetemp().parent
-        cache_file = root_tmp_dir / "neon_migration_branch.json"
-        lock_file = root_tmp_dir / "neon_migration_branch.lock"
-        migrations_done_file = root_tmp_dir / "neon_migrations_done"
-    else:
-        cache_file = None
-        lock_file = None
-        migrations_done_file = None
-
-    is_creator = False
+    env_manager = EnvironmentManager(_neon_config.env_var_name)
     branch: NeonBranch
-    branch_gen: Generator[NeonBranch, None, None] | None = None
-    original_env_value: str | None = None
+    is_creator: bool
 
-    if is_xdist:
-        assert cache_file is not None and lock_file is not None
-        assert migrations_done_file is not None
-        with FileLock(str(lock_file)):
-            if cache_file.exists():
-                # Another worker already created the branch - reuse it
-                data = json.loads(cache_file.read_text())
-                branch = _dict_to_branch(data["branch"])
-                pre_migration_fingerprint = tuple(
-                    tuple(row) for row in data["pre_migration_fingerprint"]
-                )
-                config._neon_pre_migration_fingerprint = pre_migration_fingerprint  # type: ignore[attr-defined]
-
-                # Set DATABASE_URL for this worker (not done by _create_neon_branch)
-                original_env_value = os.environ.get(env_var_name)
-                os.environ[env_var_name] = branch.connection_string
-            else:
-                # First worker - create branch and cache it
-                is_creator = True
-                branch_gen = _create_neon_branch(
-                    request,
-                    branch_expiry_override=0,
-                    branch_name_suffix="-migrated",
-                )
-                branch = next(branch_gen)
-
-                # Capture schema fingerprint BEFORE migrations run
-                pre_migration_fingerprint = _get_schema_fingerprint(
-                    branch.connection_string
-                )
-                config._neon_pre_migration_fingerprint = pre_migration_fingerprint  # type: ignore[attr-defined]
-
-                # Cache for other workers (they'll read this after lock released)
-                # Note: We cache now with pre-migration fingerprint. The branch
-                # content will have migrations applied by neon_apply_migrations.
-                cache_file.write_text(
-                    json.dumps(
-                        {
-                            "branch": _branch_to_dict(branch),
-                            "pre_migration_fingerprint": pre_migration_fingerprint,
-                        }
-                    )
-                )
-
-        # Non-creator workers must wait for migrations to complete BEFORE
-        # neon_apply_migrations runs, otherwise they'll try to run migrations
-        # concurrently on the same branch, causing race conditions.
-        if not is_creator:
-            waited = 0.0
-            poll_interval = 0.5
-            while not migrations_done_file.exists():
-                if waited >= _MIGRATION_WAIT_TIMEOUT:
-                    raise RuntimeError(
-                        f"Timeout waiting for migrations to complete after "
-                        f"{_MIGRATION_WAIT_TIMEOUT}s. The creator worker may have "
-                        f"failed or is still running migrations."
-                    )
-                time.sleep(poll_interval)
-                waited += poll_interval
-    else:
-        # Not using xdist - create branch normally
-        is_creator = True
-        branch_gen = _create_neon_branch(
-            request,
-            branch_expiry_override=0,
-            branch_name_suffix="-migrated",
+    def create_migration_branch() -> dict[str, Any]:
+        b = _neon_branch_manager.create_branch(
+            name_suffix="-migration",
+            expiry_seconds=0,  # No expiry - child branches need this
         )
-        branch = next(branch_gen)
+        return {"branch": _branch_to_dict(b)}
 
-        # Capture schema fingerprint BEFORE migrations run
-        pre_migration_fingerprint = _get_schema_fingerprint(branch.connection_string)
-        config._neon_pre_migration_fingerprint = pre_migration_fingerprint  # type: ignore[attr-defined]
+    # Coordinate branch creation across xdist workers
+    data, is_creator = _neon_xdist_coordinator.coordinate_resource(
+        "migration_branch", create_migration_branch
+    )
+    branch = _dict_to_branch(data["branch"])
 
-    # Mark whether this worker is the creator (used by neon_apply_migrations)
-    config._neon_is_migration_creator = is_creator  # type: ignore[attr-defined]
-    # Store migrations_done_file path for signaling after migrations complete
-    config._neon_migrations_done_file = migrations_done_file  # type: ignore[attr-defined]
+    # Store creator status for other fixtures
+    request.config._neon_is_migration_creator = is_creator  # type: ignore[attr-defined]
+
+    # Set DATABASE_URL
+    env_manager.set(branch.connection_string)
+
+    # Non-creators wait for migrations to complete
+    if not is_creator:
+        _neon_xdist_coordinator.wait_for_signal(
+            "migrations_done", timeout=_MIGRATION_WAIT_TIMEOUT
+        )
 
     try:
         yield branch
     finally:
-        # Restore env var if we set it (non-creator workers)
-        if original_env_value is not None:
-            os.environ[env_var_name] = original_env_value
-        elif not is_creator and env_var_name in os.environ:
-            os.environ.pop(env_var_name, None)
-
-        # Only the creator cleans up the branch
-        if is_creator and branch_gen is not None:
-            with contextlib.suppress(StopIteration):
-                next(branch_gen)
+        env_manager.restore()
+        # Only creator cleans up
+        if is_creator:
+            _neon_branch_manager.delete_branch(branch.branch_id)
 
 
 @pytest.fixture(scope="session")
@@ -1029,6 +1508,7 @@ def neon_apply_migrations(_neon_migration_branch: NeonBranch) -> Any:
 def _neon_migrations_synchronized(
     request: pytest.FixtureRequest,
     _neon_migration_branch: NeonBranch,
+    _neon_xdist_coordinator: XdistCoordinator,
     neon_apply_migrations: Any,
 ) -> Any:
     """
@@ -1042,110 +1522,271 @@ def _neon_migrations_synchronized(
 
     Without xdist, this is a simple passthrough.
     """
-    config = request.config
-    is_creator = getattr(config, "_neon_is_migration_creator", True)
-    migrations_done_file = getattr(config, "_neon_migrations_done_file", None)
+    is_creator = getattr(request.config, "_neon_is_migration_creator", True)
 
-    if is_creator and migrations_done_file is not None:
+    if is_creator:
         # Creator: migrations just ran via neon_apply_migrations dependency
-        # Signal completion to other workers (who are waiting in
-        # _neon_migration_branch)
-        migrations_done_file.write_text("done")
+        # Signal completion to other workers
+        _neon_xdist_coordinator.send_signal("migrations_done")
 
     return neon_apply_migrations
 
 
 @pytest.fixture(scope="session")
-def _neon_branch_for_reset(
-    request: pytest.FixtureRequest,
+def _neon_dirty_branch(
+    _neon_config: NeonConfig,
+    _neon_branch_manager: NeonBranchManager,
+    _neon_xdist_coordinator: XdistCoordinator,
     _neon_migration_branch: NeonBranch,
-    _neon_migrations_synchronized: Any,  # Ensures migrations complete; for detection
+    _neon_migrations_synchronized: Any,  # Ensures migrations complete first
 ) -> Generator[NeonBranch, None, None]:
     """
-    Internal fixture that creates a test branch from the migration branch.
+    Session-scoped dirty branch shared across ALL xdist workers.
 
-    This is session-scoped so DATABASE_URL remains stable throughout the test
-    session, avoiding issues with Python's module caching (e.g., SQLAlchemy
-    engines created at import time would otherwise point to stale branches).
+    This branch is a child of the migration branch. All tests using
+    neon_branch_dirty share this single branch - writes persist and
+    are visible to all tests (even across workers).
 
-    Parallel Test Support (pytest-xdist):
-        When running tests in parallel with pytest-xdist, each worker gets its
-        own branch. This prevents database state pollution between tests running
-        concurrently on different workers. The worker ID is included in the
-        branch name suffix (e.g., "-test-gw0", "-test-gw1").
-
-    Smart Migration Detection:
-        This fixture implements a cost-optimization strategy:
-
-        1. If neon_apply_migrations was not overridden (returns sentinel),
-           skip creating a separate test branch - use the migration branch directly.
-
-        2. If neon_apply_migrations was overridden, compare schema fingerprints
-           before/after migrations. Only create a child branch if the schema
-           actually changed.
-
-        This avoids unnecessary Neon costs and branch slots when:
-        - No migration fixture is defined
-        - Migrations exist but are already applied (no schema changes)
+    This is the "dirty" branch because:
+    - No reset between tests
+    - Shared across all workers (concurrent writes possible)
+    - Fast because no per-test overhead
     """
-    # Check if migrations fixture was overridden
-    # _neon_migrations_synchronized passes through the neon_apply_migrations value
-    migrations_defined = _neon_migrations_synchronized is not _MIGRATIONS_NOT_DEFINED
+    env_manager = EnvironmentManager(_neon_config.env_var_name)
+    branch: NeonBranch
+    is_creator: bool
 
-    # Check if schema actually changed (if we have a pre-migration fingerprint)
-    pre_fingerprint = getattr(request.config, "_neon_pre_migration_fingerprint", ())
-    schema_changed = False
-
-    if migrations_defined and pre_fingerprint:
-        # Compare with current schema
-        conn_str = _neon_migration_branch.connection_string
-        post_fingerprint = _get_schema_fingerprint(conn_str)
-        schema_changed = pre_fingerprint != post_fingerprint
-    elif migrations_defined and not pre_fingerprint:
-        # No fingerprint available (no psycopg/psycopg2 installed)
-        # Assume migrations changed something to be safe
-        schema_changed = True
-
-    # Get worker ID for parallel test support
-    # Each xdist worker gets its own branch to avoid state pollution
-    worker_id = _get_xdist_worker_id()
-    branch_suffix = f"-test-{worker_id}"
-
-    # Only create a child branch if migrations actually modified the schema
-    # OR if we're running under xdist (each worker needs its own branch)
-    if schema_changed or worker_id != "main":
-        yield from _create_neon_branch(
-            request,
-            parent_branch_id_override=_neon_migration_branch.branch_id,
-            branch_name_suffix=branch_suffix,
+    def create_dirty_branch() -> dict[str, Any]:
+        b = _neon_branch_manager.create_branch(
+            name_suffix="-dirty",
+            parent_branch_id=_neon_migration_branch.branch_id,
+            expiry_seconds=_neon_config.branch_expiry,
         )
-    else:
-        # No schema changes and not parallel - reuse the migration branch directly
-        # This saves creating an unnecessary branch
-        yield _neon_migration_branch
+        return {"branch": _branch_to_dict(b)}
+
+    # Coordinate dirty branch creation - shared across ALL workers
+    data, is_creator = _neon_xdist_coordinator.coordinate_resource(
+        "dirty_branch", create_dirty_branch
+    )
+    branch = _dict_to_branch(data["branch"])
+
+    # Set DATABASE_URL
+    env_manager.set(branch.connection_string)
+
+    try:
+        yield branch
+    finally:
+        env_manager.restore()
+        # Only creator cleans up
+        if is_creator:
+            _neon_branch_manager.delete_branch(branch.branch_id)
+
+
+@pytest.fixture(scope="session")
+def _neon_readonly_endpoint(
+    _neon_config: NeonConfig,
+    _neon_branch_manager: NeonBranchManager,
+    _neon_xdist_coordinator: XdistCoordinator,
+    _neon_migration_branch: NeonBranch,
+    _neon_migrations_synchronized: Any,  # Ensures migrations complete first
+) -> Generator[NeonBranch, None, None]:
+    """
+    Session-scoped read_only endpoint on the migration branch.
+
+    This is a true read-only endpoint - writes are blocked at the database
+    level. All workers share this endpoint since it's read-only anyway.
+    """
+    env_manager = EnvironmentManager(_neon_config.env_var_name)
+    branch: NeonBranch
+    is_creator: bool
+
+    def create_readonly_endpoint() -> dict[str, Any]:
+        b = _neon_branch_manager.create_readonly_endpoint(_neon_migration_branch)
+        return {"branch": _branch_to_dict(b)}
+
+    # Coordinate endpoint creation - shared across ALL workers
+    data, is_creator = _neon_xdist_coordinator.coordinate_resource(
+        "readonly_endpoint", create_readonly_endpoint
+    )
+    branch = _dict_to_branch(data["branch"])
+
+    # Set DATABASE_URL
+    env_manager.set(branch.connection_string)
+
+    try:
+        yield branch
+    finally:
+        env_manager.restore()
+        # Only creator cleans up the endpoint
+        if is_creator and branch.endpoint_id:
+            _neon_branch_manager.delete_endpoint(branch.endpoint_id)
+
+
+@pytest.fixture(scope="session")
+def _neon_isolated_branch(
+    request: pytest.FixtureRequest,
+    _neon_config: NeonConfig,
+    _neon_branch_manager: NeonBranchManager,
+    _neon_xdist_coordinator: XdistCoordinator,
+    _neon_migration_branch: NeonBranch,
+    _neon_migrations_synchronized: Any,  # Ensures migrations complete first
+) -> Generator[NeonBranch, None, None]:
+    """
+    Session-scoped isolated branch, one per xdist worker.
+
+    Each worker gets its own branch. Unlike the dirty branch, this is
+    per-worker to allow reset operations without affecting other workers.
+
+    The branch is reset after each test that uses neon_branch_isolated.
+    """
+    env_manager = EnvironmentManager(_neon_config.env_var_name)
+    worker_id = _neon_xdist_coordinator.worker_id
+
+    # Each worker creates its own isolated branch - no coordination needed
+    # because each worker has a unique ID
+    branch = _neon_branch_manager.create_branch(
+        name_suffix=f"-isolated-{worker_id}",
+        parent_branch_id=_neon_migration_branch.branch_id,
+        expiry_seconds=_neon_config.branch_expiry,
+    )
+
+    # Store branch manager on config for reset operations
+    request.config._neon_isolated_branch_manager = _neon_branch_manager  # type: ignore[attr-defined]
+
+    # Set DATABASE_URL
+    env_manager.set(branch.connection_string)
+
+    try:
+        yield branch
+    finally:
+        env_manager.restore()
+        _neon_branch_manager.delete_branch(branch.branch_id)
+
+
+@pytest.fixture(scope="session")
+def neon_branch_readonly(
+    _neon_config: NeonConfig,
+    _neon_readonly_endpoint: NeonBranch,
+) -> NeonBranch:
+    """
+    Provide a true read-only Neon database connection.
+
+    This fixture uses a read_only endpoint on the migration branch, which
+    enforces read-only access at the database level. Any attempt to write
+    will result in a database error.
+
+    This is the recommended fixture for tests that only read data (SELECT queries).
+    It's session-scoped and shared across all tests and workers since it's read-only.
+
+    Use this fixture when your tests only perform SELECT queries.
+    For tests that INSERT, UPDATE, or DELETE data, use ``neon_branch_dirty``
+    (for shared state) or ``neon_branch_isolated`` (for test isolation).
+
+    The connection string is automatically set in the DATABASE_URL environment
+    variable (configurable via --neon-env-var).
+
+    Requires either:
+        - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
+        - --neon-api-key and --neon-project-id command line options
+
+    Returns:
+        NeonBranch: Object with branch_id, project_id, connection_string, and host.
+
+    Example::
+
+        def test_query_users(neon_branch_readonly):
+            # DATABASE_URL is automatically set
+            conn_string = os.environ["DATABASE_URL"]
+
+            # Read-only query
+            with psycopg.connect(conn_string) as conn:
+                result = conn.execute("SELECT * FROM users").fetchall()
+                assert len(result) > 0
+
+            # This would fail with a database error:
+            # conn.execute("INSERT INTO users (name) VALUES ('test')")
+    """
+    # DATABASE_URL is already set by _neon_readonly_endpoint
+    return _neon_readonly_endpoint
+
+
+@pytest.fixture(scope="session")
+def neon_branch_dirty(
+    _neon_config: NeonConfig,
+    _neon_dirty_branch: NeonBranch,
+) -> NeonBranch:
+    """
+    Provide a session-scoped Neon database branch for read-write access.
+
+    All tests share the same branch and writes persist across tests (no cleanup
+    between tests). This is faster than neon_branch_isolated because there's no
+    reset overhead.
+
+    Use this fixture when:
+    - Most tests can share database state without interference
+    - You want maximum performance with minimal API calls
+    - You manually manage test data cleanup if needed
+    - You're using it alongside ``neon_branch_isolated`` for specific tests
+      that need guaranteed clean state
+
+    The connection string is automatically set in the DATABASE_URL environment
+    variable (configurable via --neon-env-var).
+
+    Warning:
+        Data written by one test WILL be visible to subsequent tests AND to
+        other xdist workers. This is truly shared - use ``neon_branch_isolated``
+        for tests that require guaranteed clean state.
+
+    pytest-xdist:
+        ALL workers share the same dirty branch. Concurrent writes from different
+        workers may conflict. This is "dirty" by design - for isolation, use
+        ``neon_branch_isolated``.
+
+    Requires either:
+        - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
+        - --neon-api-key and --neon-project-id command line options
+
+    Returns:
+        NeonBranch: Object with branch_id, project_id, connection_string, and host.
+
+    Example::
+
+        def test_insert_user(neon_branch_dirty):
+            # DATABASE_URL is automatically set
+            import psycopg
+            with psycopg.connect(neon_branch_dirty.connection_string) as conn:
+                conn.execute("INSERT INTO users (name) VALUES ('test')")
+                conn.commit()
+            # Data persists - next test will see this user
+
+        def test_count_users(neon_branch_dirty):
+            # This test sees data from previous tests
+            import psycopg
+            with psycopg.connect(neon_branch_dirty.connection_string) as conn:
+                result = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+                # Count includes users from previous tests
+    """
+    # DATABASE_URL is already set by _neon_dirty_branch
+    return _neon_dirty_branch
 
 
 @pytest.fixture(scope="function")
-def neon_branch_readwrite(
+def neon_branch_isolated(
     request: pytest.FixtureRequest,
-    _neon_branch_for_reset: NeonBranch,
+    _neon_config: NeonConfig,
+    _neon_isolated_branch: NeonBranch,
 ) -> Generator[NeonBranch, None, None]:
     """
-    Provide a read-write Neon database branch with reset after each test.
+    Provide an isolated Neon database branch with reset after each test.
 
-    This is the recommended fixture for tests that modify database state.
-    It creates one branch per test session, then resets it to the parent
-    branch's state after each test. This provides test isolation with
-    ~0.5s overhead per test.
+    This is the recommended fixture for tests that modify database state and
+    need isolation. Each xdist worker has its own branch, and the branch is
+    reset to the migration state after each test.
 
-    Use this fixture when your tests INSERT, UPDATE, or DELETE data.
-    For read-only tests, use ``neon_branch_readonly`` instead for better
-    performance (no reset overhead).
-
-    The branch is automatically deleted after all tests complete, unless
-    --neon-keep-branches is specified. Branches also auto-expire after
-    10 minutes by default (configurable via --neon-branch-expiry) as a safety net
-    for interrupted test runs.
+    Use this fixture when:
+    - Tests modify database state (INSERT, UPDATE, DELETE)
+    - You need test isolation (each test starts with clean state)
+    - You're using it alongside ``neon_branch_dirty`` for specific tests
 
     The connection string is automatically set in the DATABASE_URL environment
     variable (configurable via --neon-env-var).
@@ -1159,6 +1800,10 @@ def neon_branch_readwrite(
         Branch resets terminate server-side connections. Without pool_pre_ping,
         SQLAlchemy may reuse dead pooled connections, causing SSL errors.
 
+    pytest-xdist:
+        Each worker has its own isolated branch. Resets only affect that worker's
+        branch, so workers don't interfere with each other.
+
     Requires either:
         - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
         - --neon-api-key and --neon-project-id command line options
@@ -1168,114 +1813,81 @@ def neon_branch_readwrite(
 
     Example::
 
-        def test_insert_user(neon_branch_readwrite):
+        def test_insert_user(neon_branch_isolated):
             # DATABASE_URL is automatically set
             conn_string = os.environ["DATABASE_URL"]
-            # or use directly
-            conn_string = neon_branch_readwrite.connection_string
 
             # Insert data - branch will reset after this test
             with psycopg.connect(conn_string) as conn:
                 conn.execute("INSERT INTO users (name) VALUES ('test')")
                 conn.commit()
+            # Next test starts with clean state
     """
-    config = request.config
-    api_key = _get_config_value(config, "neon_api_key", "NEON_API_KEY", "neon_api_key")
+    # DATABASE_URL is already set by _neon_isolated_branch
+    yield _neon_isolated_branch
 
-    # Validate that branch has a parent for reset functionality
-    if not _neon_branch_for_reset.parent_id:
-        pytest.fail(
-            f"\n\nBranch {_neon_branch_for_reset.branch_id} has no parent. "
-            f"The neon_branch_readwrite fixture requires a parent branch for "
-            f"reset.\n\n"
-            f"Use neon_branch_readonly if you don't need reset, or specify "
-            f"a parent branch with --neon-parent-branch or NEON_PARENT_BRANCH_ID."
-        )
-
-    yield _neon_branch_for_reset
-
-    # Reset branch to parent state after each test
-    if api_key:
+    # Reset branch to migration state after each test
+    branch_manager = getattr(
+        request.config, "_neon_isolated_branch_manager", None
+    )
+    if branch_manager is not None:
         try:
-            _reset_branch_to_parent(branch=_neon_branch_for_reset, api_key=api_key)
+            branch_manager.reset_branch(_neon_isolated_branch)
         except Exception as e:
             pytest.fail(
-                f"\n\nFailed to reset branch {_neon_branch_for_reset.branch_id} "
-                f"after test. Subsequent tests in this module may see dirty "
-                f"database state.\n\nError: {e}\n\n"
+                f"\n\nFailed to reset branch {_neon_isolated_branch.branch_id} "
+                f"after test. Subsequent tests may see dirty state.\n\n"
+                f"Error: {e}\n\n"
                 f"To keep the branch for debugging, use --neon-keep-branches"
             )
 
 
 @pytest.fixture(scope="function")
-def neon_branch_readonly(
-    _neon_branch_for_reset: NeonBranch,
-) -> NeonBranch:
+def neon_branch_readwrite(
+    neon_branch_isolated: NeonBranch,
+) -> Generator[NeonBranch, None, None]:
     """
-    Provide a read-only Neon database branch without reset.
+    Deprecated: Use ``neon_branch_isolated`` instead.
 
-    This is the recommended fixture for tests that only read data (SELECT queries).
-    No branch reset occurs after each test, making it faster than
-    ``neon_branch_readwrite`` (~0.5s saved per test).
+    This fixture is now an alias for ``neon_branch_isolated``.
 
-    Use this fixture when your tests only perform SELECT queries and don't
-    modify database state. For tests that INSERT, UPDATE, or DELETE data,
-    use ``neon_branch_readwrite`` instead to ensure test isolation.
-
-    Warning:
-        If you accidentally write data using this fixture, subsequent tests
-        will see those modifications. The fixture does not enforce read-only
-        access at the database level - it simply skips the reset step.
-
-    The connection string is automatically set in the DATABASE_URL environment
-    variable (configurable via --neon-env-var).
-
-    Requires either:
-        - NEON_API_KEY and NEON_PROJECT_ID environment variables, or
-        - --neon-api-key and --neon-project-id command line options
-
-    Yields:
-        NeonBranch: Object with branch_id, project_id, connection_string, and host.
-
-    Example::
-
-        def test_query_users(neon_branch_readonly):
-            # DATABASE_URL is automatically set
-            conn_string = os.environ["DATABASE_URL"]
-
-            # Read-only query - no reset needed after this test
-            with psycopg.connect(conn_string) as conn:
-                result = conn.execute("SELECT * FROM users").fetchall()
-                assert len(result) > 0
+    .. deprecated:: 2.3.0
+        Use ``neon_branch_isolated`` for tests that modify data with reset,
+        ``neon_branch_dirty`` for shared state, or ``neon_branch_readonly``
+        for read-only access.
     """
-    return _neon_branch_for_reset
+    warnings.warn(
+        "neon_branch_readwrite is deprecated. Use neon_branch_isolated (for tests "
+        "that modify data with isolation) or neon_branch_dirty (for shared state).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    yield neon_branch_isolated
 
 
 @pytest.fixture(scope="function")
 def neon_branch(
-    request: pytest.FixtureRequest,
-    neon_branch_readwrite: NeonBranch,
+    neon_branch_isolated: NeonBranch,
 ) -> Generator[NeonBranch, None, None]:
     """
-    Deprecated: Use ``neon_branch_readwrite`` or ``neon_branch_readonly`` instead.
+    Deprecated: Use ``neon_branch_isolated``, ``neon_branch_dirty``, or
+    ``neon_branch_readonly`` instead.
 
-    This fixture is an alias for ``neon_branch_readwrite`` and will be removed
-    in a future version. Please migrate to the explicit fixture names:
-
-    - ``neon_branch_readwrite``: For tests that modify data (INSERT/UPDATE/DELETE)
-    - ``neon_branch_readonly``: For tests that only read data (SELECT)
+    This fixture is now an alias for ``neon_branch_isolated``.
 
     .. deprecated:: 1.1.0
-        Use ``neon_branch_readwrite`` for read-write access with reset,
-        or ``neon_branch_readonly`` for read-only access without reset.
+        Use ``neon_branch_isolated`` for tests that modify data with reset,
+        ``neon_branch_dirty`` for shared state, or ``neon_branch_readonly``
+        for read-only access.
     """
     warnings.warn(
-        "neon_branch is deprecated. Use neon_branch_readwrite (for tests that "
-        "modify data) or neon_branch_readonly (for read-only tests) instead.",
+        "neon_branch is deprecated. Use neon_branch_isolated (for tests that "
+        "modify data), neon_branch_dirty (for shared state), or "
+        "neon_branch_readonly (for read-only tests).",
         DeprecationWarning,
         stacklevel=2,
     )
-    yield neon_branch_readwrite
+    yield neon_branch_isolated
 
 
 @pytest.fixture(scope="module")
@@ -1319,7 +1931,7 @@ def neon_branch_shared(
 
 
 @pytest.fixture
-def neon_connection(neon_branch: NeonBranch):
+def neon_connection(neon_branch_isolated: NeonBranch):
     """
     Provide a psycopg2 connection to the test branch.
 
@@ -1327,6 +1939,7 @@ def neon_connection(neon_branch: NeonBranch):
         pip install pytest-neon[psycopg2]
 
     The connection is rolled back and closed after each test.
+    Uses neon_branch_isolated for test isolation.
 
     Yields:
         psycopg2 connection object
@@ -1348,21 +1961,21 @@ def neon_connection(neon_branch: NeonBranch):
             "  The 'neon_connection' fixture requires psycopg2.\n\n"
             "  To fix this, install the psycopg2 extra:\n\n"
             "      pip install pytest-neon[psycopg2]\n\n"
-            "  Or use the 'neon_branch' fixture with your own database driver:\n\n"
-            "      def test_example(neon_branch):\n"
+            "  Or use the 'neon_branch_isolated' fixture with your own driver:\n\n"
+            "      def test_example(neon_branch_isolated):\n"
             "          import your_driver\n"
-            "          conn = your_driver.connect(neon_branch.connection_string)\n\n"
+            "          conn = your_driver.connect(neon_branch_isolated.connection_string)\n\n"
             "═══════════════════════════════════════════════════════════════════\n"
         )
 
-    conn = psycopg2.connect(neon_branch.connection_string)
+    conn = psycopg2.connect(neon_branch_isolated.connection_string)
     yield conn
     conn.rollback()
     conn.close()
 
 
 @pytest.fixture
-def neon_connection_psycopg(neon_branch: NeonBranch):
+def neon_connection_psycopg(neon_branch_isolated: NeonBranch):
     """
     Provide a psycopg (v3) connection to the test branch.
 
@@ -1370,6 +1983,7 @@ def neon_connection_psycopg(neon_branch: NeonBranch):
         pip install pytest-neon[psycopg]
 
     The connection is rolled back and closed after each test.
+    Uses neon_branch_isolated for test isolation.
 
     Yields:
         psycopg connection object
@@ -1391,21 +2005,21 @@ def neon_connection_psycopg(neon_branch: NeonBranch):
             "  The 'neon_connection_psycopg' fixture requires psycopg v3.\n\n"
             "  To fix this, install the psycopg extra:\n\n"
             "      pip install pytest-neon[psycopg]\n\n"
-            "  Or use the 'neon_branch' fixture with your own database driver:\n\n"
-            "      def test_example(neon_branch):\n"
+            "  Or use the 'neon_branch_isolated' fixture with your own driver:\n\n"
+            "      def test_example(neon_branch_isolated):\n"
             "          import your_driver\n"
-            "          conn = your_driver.connect(neon_branch.connection_string)\n\n"
+            "          conn = your_driver.connect(neon_branch_isolated.connection_string)\n\n"
             "═══════════════════════════════════════════════════════════════════\n"
         )
 
-    conn = psycopg.connect(neon_branch.connection_string)
+    conn = psycopg.connect(neon_branch_isolated.connection_string)
     yield conn
     conn.rollback()
     conn.close()
 
 
 @pytest.fixture
-def neon_engine(neon_branch: NeonBranch):
+def neon_engine(neon_branch_isolated: NeonBranch):
     """
     Provide a SQLAlchemy engine connected to the test branch.
 
@@ -1413,7 +2027,7 @@ def neon_engine(neon_branch: NeonBranch):
         pip install pytest-neon[sqlalchemy]
 
     The engine is disposed after each test, which handles stale connections
-    after branch resets automatically.
+    after branch resets automatically. Uses neon_branch_isolated for test isolation.
 
     Note:
         If you create your own module-level engine instead of using this
@@ -1445,13 +2059,13 @@ def neon_engine(neon_branch: NeonBranch):
             "  The 'neon_engine' fixture requires SQLAlchemy.\n\n"
             "  To fix this, install the sqlalchemy extra:\n\n"
             "      pip install pytest-neon[sqlalchemy]\n\n"
-            "  Or use the 'neon_branch' fixture with your own database driver:\n\n"
-            "      def test_example(neon_branch):\n"
+            "  Or use the 'neon_branch_isolated' fixture with your own driver:\n\n"
+            "      def test_example(neon_branch_isolated):\n"
             "          from sqlalchemy import create_engine\n"
-            "          engine = create_engine(neon_branch.connection_string)\n\n"
+            "          engine = create_engine(neon_branch_isolated.connection_string)\n\n"
             "═══════════════════════════════════════════════════════════════════\n"
         )
 
-    engine = create_engine(neon_branch.connection_string)
+    engine = create_engine(neon_branch_isolated.connection_string)
     yield engine
     engine.dispose()
