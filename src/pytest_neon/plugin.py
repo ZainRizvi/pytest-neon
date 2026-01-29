@@ -353,7 +353,7 @@ class NeonConfig:
     env_var_name: str
 
     @classmethod
-    def from_pytest_config(cls, config: pytest.Config) -> "NeonConfig | None":
+    def from_pytest_config(cls, config: pytest.Config) -> NeonConfig | None:
         """
         Extract NeonConfig from pytest configuration.
 
@@ -438,7 +438,7 @@ class NeonBranchManager:
 
         Args:
             name_suffix: Suffix to add to branch name (e.g., "-migration", "-dirty")
-            parent_branch_id: Parent branch ID (defaults to config's parent or project default)
+            parent_branch_id: Parent branch ID (defaults to config's parent)
             expiry_seconds: Branch expiry in seconds (0 or None for no expiry)
 
         Returns:
@@ -563,7 +563,8 @@ class NeonBranchManager:
                 operation_name="branch_delete",
             )
         except Exception as e:
-            warnings.warn(f"Failed to delete Neon branch {branch_id}: {e}", stacklevel=2)
+            msg = f"Failed to delete Neon branch {branch_id}: {e}"
+            warnings.warn(msg, stacklevel=2)
 
     def delete_endpoint(self, endpoint_id: str) -> None:
         """Delete an endpoint (silently ignores errors)."""
@@ -582,7 +583,8 @@ class NeonBranchManager:
     def reset_branch(self, branch: NeonBranch) -> None:
         """Reset a branch to its parent's state."""
         if not branch.parent_id:
-            raise RuntimeError(f"Branch {branch.branch_id} has no parent - cannot reset")
+            msg = f"Branch {branch.branch_id} has no parent - cannot reset"
+            raise RuntimeError(msg)
 
         _reset_branch_to_parent(branch, self.config.api_key)
 
@@ -1148,7 +1150,9 @@ def _create_readonly_endpoint(
 
     while True:
         endpoint_response = _retry_on_rate_limit(
-            lambda: neon.endpoint(project_id=branch.project_id, endpoint_id=endpoint_id),
+            lambda: neon.endpoint(
+                project_id=branch.project_id, endpoint_id=endpoint_id
+            ),
             operation_name="endpoint_status_readonly",
         )
         endpoint = endpoint_response.endpoint
@@ -1159,8 +1163,8 @@ def _create_readonly_endpoint(
 
         if waited >= max_wait_seconds:
             raise RuntimeError(
-                f"Timeout waiting for read_only endpoint {endpoint_id} to become active "
-                f"(current state: {state})"
+                f"Timeout waiting for read_only endpoint {endpoint_id} "
+                f"to become active (current state: {state})"
             )
 
         time.sleep(poll_interval)
@@ -1199,7 +1203,9 @@ def _delete_endpoint(project_id: str, endpoint_id: str, api_key: str) -> None:
     neon = NeonAPI(api_key=api_key)
     try:
         _retry_on_rate_limit(
-            lambda: neon.endpoint_delete(project_id=project_id, endpoint_id=endpoint_id),
+            lambda: neon.endpoint_delete(
+                project_id=project_id, endpoint_id=endpoint_id
+            ),
             operation_name="endpoint_delete",
         )
     except Exception as e:
@@ -1964,7 +1970,8 @@ def neon_connection(neon_branch_isolated: NeonBranch):
             "  Or use the 'neon_branch_isolated' fixture with your own driver:\n\n"
             "      def test_example(neon_branch_isolated):\n"
             "          import your_driver\n"
-            "          conn = your_driver.connect(neon_branch_isolated.connection_string)\n\n"
+            "          conn = your_driver.connect(\n"
+            "              neon_branch_isolated.connection_string)\n\n"
             "═══════════════════════════════════════════════════════════════════\n"
         )
 
@@ -2008,7 +2015,8 @@ def neon_connection_psycopg(neon_branch_isolated: NeonBranch):
             "  Or use the 'neon_branch_isolated' fixture with your own driver:\n\n"
             "      def test_example(neon_branch_isolated):\n"
             "          import your_driver\n"
-            "          conn = your_driver.connect(neon_branch_isolated.connection_string)\n\n"
+            "          conn = your_driver.connect(\n"
+            "              neon_branch_isolated.connection_string)\n\n"
             "═══════════════════════════════════════════════════════════════════\n"
         )
 
@@ -2062,7 +2070,8 @@ def neon_engine(neon_branch_isolated: NeonBranch):
             "  Or use the 'neon_branch_isolated' fixture with your own driver:\n\n"
             "      def test_example(neon_branch_isolated):\n"
             "          from sqlalchemy import create_engine\n"
-            "          engine = create_engine(neon_branch_isolated.connection_string)\n\n"
+            "          engine = create_engine(\n"
+            "              neon_branch_isolated.connection_string)\n\n"
             "═══════════════════════════════════════════════════════════════════\n"
         )
 
