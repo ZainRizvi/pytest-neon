@@ -1212,7 +1212,7 @@ wheels = [
 
 [[package]]
 name = "pytest-neon"
-version = "2.3.0"
+version = "2.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "filelock", version = "3.19.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
