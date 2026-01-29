@@ -5,7 +5,7 @@ class TestReadonlySessionScoped:
     """Test that neon_branch_readonly is session-scoped."""
 
     def test_readonly_is_session_scoped(self, pytester):
-        """Verify that neon_branch_readonly is session-scoped (same instance across tests)."""
+        """Verify neon_branch_readonly is session-scoped (same instance per session)."""
         pytester.makeconftest(
             """
             import os
@@ -44,8 +44,12 @@ class TestReadonlySessionScoped:
 
             def pytest_sessionfinish(session, exitstatus):
                 # Verify same instance was used across all tests
-                assert len(instance_ids) == 3, f"Expected 3 tests, got {len(instance_ids)}"
-                assert len(set(instance_ids)) == 1, f"Expected same instance, got {len(set(instance_ids))} different"
+                assert len(instance_ids) == 3, (
+                    f"Expected 3 tests, got {len(instance_ids)}"
+                )
+                assert len(set(instance_ids)) == 1, (
+                    f"Got {len(set(instance_ids))} different instances, expected 1"
+                )
         """
         )
 

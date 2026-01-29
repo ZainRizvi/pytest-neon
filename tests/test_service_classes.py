@@ -86,7 +86,7 @@ class TestXdistCoordinator:
         create_fn.assert_called_once()
 
     def test_coordinate_resource_caches_with_xdist(self, tmp_path):
-        """coordinate_resource() uses file cache with xdist (first call creates, second reuses)."""
+        """coordinate_resource() uses file cache with xdist."""
         mock_tmp_path_factory = MagicMock()
         mock_tmp_path_factory.getbasetemp.return_value.parent = tmp_path
 
