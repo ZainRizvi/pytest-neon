@@ -306,6 +306,37 @@ def _extract_password_from_connection_string(connection_string: str) -> str:
     raise ValueError(f"No password found in connection string: {connection_string}")
 
 
+def _reveal_role_password(
+    api_key: str, project_id: str, branch_id: str, role_name: str
+) -> str:
+    """
+    Get the password for a role WITHOUT resetting it.
+
+    Uses Neon's reveal_password API endpoint (GET request).
+
+    Note: The neon-api library has a bug where it uses POST instead of GET,
+    so we make the request directly.
+    """
+    url = (
+        f"https://console.neon.tech/api/v2/projects/{project_id}"
+        f"/branches/{branch_id}/roles/{role_name}/reveal_password"
+    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+    }
+
+    response = requests.get(url, headers=headers, timeout=30)
+    try:
+        response.raise_for_status()
+    except requests.exceptions.HTTPError:
+        # Wrap in NeonAPIError for consistent error handling
+        raise NeonAPIError(response.text) from None
+
+    data = response.json()
+    return data["password"]
+
+
 def _get_schema_fingerprint(connection_string: str) -> tuple[tuple[Any, ...], ...]:
     """
     Get a fingerprint of the database schema for change detection.
@@ -508,7 +539,7 @@ class NeonBranchManager:
             )
 
         # Get password
-        connection_string = self._reset_password_and_build_connection_string(
+        connection_string = self._get_password_and_build_connection_string(
             branch.id, host
         )
 
@@ -632,19 +663,19 @@ class NeonBranchManager:
             time.sleep(poll_interval)
             waited += poll_interval
 
-    def _reset_password_and_build_connection_string(
+    def _get_password_and_build_connection_string(
         self, branch_id: str, host: str
     ) -> str:
-        """Reset role password and build connection string."""
-        password_response = _retry_on_rate_limit(
-            lambda: self._neon.role_password_reset(
+        """Get role password (without resetting) and build connection string."""
+        password = _retry_on_rate_limit(
+            lambda: _reveal_role_password(
+                api_key=self.config.api_key,
                 project_id=self.config.project_id,
                 branch_id=branch_id,
                 role_name=self.config.role_name,
             ),
-            operation_name="role_password_reset",
+            operation_name="role_password_reveal",
         )
-        password = password_response.role.password
 
         return (
             f"postgresql://{self.config.role_name}:{password}@{host}/"
@@ -1047,31 +1078,17 @@ def _create_neon_branch(
 
     host = endpoint.host
 
-    # SAFETY CHECK: Ensure we never reset password on the default/production branch
-    # This should be impossible since we just created this branch, but we check
-    # defensively to prevent catastrophic mistakes if there's ever a bug
-    default_branch_id = getattr(config, "_neon_default_branch_id", None)
-    if default_branch_id and branch.id == default_branch_id:
-        raise RuntimeError(
-            f"SAFETY CHECK FAILED: Attempted to reset password on default branch "
-            f"{branch.id}. This should never happen - the plugin creates new "
-            f"branches and should never operate on the default branch. "
-            f"Please report this bug at https://github.com/ZainRizvi/pytest-neon/issues"
-        )
-
-    # Reset password to get the password value
-    # (newly created branches don't expose password)
-    # Wrap in retry logic to handle rate limits
-    # See: https://api-docs.neon.tech/reference/api-rate-limiting
-    password_response = _retry_on_rate_limit(
-        lambda: neon.role_password_reset(
+    # Get password using reveal (not reset) to avoid invalidating existing connections
+    # See: https://api-docs.neon.tech/reference/getprojectbranchrolepassword
+    password = _retry_on_rate_limit(
+        lambda: _reveal_role_password(
+            api_key=api_key,
             project_id=project_id,
             branch_id=branch.id,
             role_name=role_name,
         ),
-        operation_name="role_password_reset",
+        operation_name="role_password_reveal",
     )
-    password = password_response.role.password
 
     # Build connection string
     connection_string = (

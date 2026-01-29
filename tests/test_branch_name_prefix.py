@@ -136,9 +136,11 @@ class TestBranchNameWithGitBranch:
         with (
             patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
             patch("pytest_neon.plugin._get_git_branch_name") as mock_git,
+            patch("pytest_neon.plugin._reveal_role_password") as mock_reveal,
         ):
             # _get_git_branch_name returns sanitized value (slashes -> hyphens)
             mock_git.return_value = "feature-my-branch"
+            mock_reveal.return_value = "testpass"
 
             mock_api = MagicMock()
             mock_neon_cls.return_value = mock_api
@@ -162,10 +164,6 @@ class TestBranchNameWithGitBranch:
             mock_endpoint_response.endpoint.current_state = EndpointState.active
             mock_endpoint_response.endpoint.host = "test.neon.tech"
             mock_api.endpoint.return_value = mock_endpoint_response
-
-            mock_password = MagicMock()
-            mock_password.role.password = "testpass"
-            mock_api.role_password_reset.return_value = mock_password
 
             gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
             with contextlib.suppress(StopIteration):
@@ -210,9 +208,11 @@ class TestBranchNameWithGitBranch:
         with (
             patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
             patch("pytest_neon.plugin._get_git_branch_name") as mock_git,
+            patch("pytest_neon.plugin._reveal_role_password") as mock_reveal,
         ):
             # _get_git_branch_name returns sanitized value
             mock_git.return_value = "feature-very-long-branch-name-truncated"
+            mock_reveal.return_value = "testpass"
 
             mock_api = MagicMock()
             mock_neon_cls.return_value = mock_api
@@ -236,10 +236,6 @@ class TestBranchNameWithGitBranch:
             mock_endpoint_response.endpoint.current_state = EndpointState.active
             mock_endpoint_response.endpoint.host = "test.neon.tech"
             mock_api.endpoint.return_value = mock_endpoint_response
-
-            mock_password = MagicMock()
-            mock_password.role.password = "testpass"
-            mock_api.role_password_reset.return_value = mock_password
 
             gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
             with contextlib.suppress(StopIteration):
@@ -284,8 +280,10 @@ class TestBranchNameWithGitBranch:
         with (
             patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
             patch("pytest_neon.plugin._get_git_branch_name") as mock_git,
+            patch("pytest_neon.plugin._reveal_role_password") as mock_reveal,
         ):
             mock_git.return_value = None  # Not in a git repo
+            mock_reveal.return_value = "testpass"
 
             mock_api = MagicMock()
             mock_neon_cls.return_value = mock_api
@@ -309,10 +307,6 @@ class TestBranchNameWithGitBranch:
             mock_endpoint_response.endpoint.current_state = EndpointState.active
             mock_endpoint_response.endpoint.host = "test.neon.tech"
             mock_api.endpoint.return_value = mock_endpoint_response
-
-            mock_password = MagicMock()
-            mock_password.role.password = "testpass"
-            mock_api.role_password_reset.return_value = mock_password
 
             gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
             with contextlib.suppress(StopIteration):
