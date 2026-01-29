@@ -14,46 +14,77 @@ This is a pytest plugin that provides isolated Neon database branches for integr
 - **Migration fixture**: `_neon_migration_branch` - Session-scoped, parent for all test branches
 - **User migration hook**: `neon_apply_migrations` - Session-scoped no-op, users override to run migrations
 - **Core fixtures**:
-  - `neon_branch_readwrite` - Function-scoped, resets after each test (recommended for write tests)
-  - `neon_branch_readonly` - Function-scoped, NO reset (recommended for read-only tests, faster)
-  - `neon_branch` - Deprecated alias for `neon_branch_readwrite`
+  - `neon_branch_readonly` - Session-scoped, uses true read_only endpoint (enforced read-only)
+  - `neon_branch_dirty` - Session-scoped, shared across ALL xdist workers (fast, shared state)
+  - `neon_branch_isolated` - Function-scoped, per-worker branch with reset after each test (recommended for writes)
+  - `neon_branch_readwrite` - Deprecated alias for `neon_branch_isolated`
+  - `neon_branch` - Deprecated alias for `neon_branch_isolated`
 - **Shared fixture**: `neon_branch_shared` - Module-scoped, no reset between tests
 - **Convenience fixtures**: `neon_connection`, `neon_connection_psycopg`, `neon_engine` - Optional, require extras
 
+## Branch Hierarchy
+
+```
+Parent Branch (configured or project default)
+    └── Migration Branch (session-scoped, read_write endpoint)
+            │   ↑ migrations run here ONCE
+            │
+            ├── Read-only Endpoint (read_only endpoint ON migration branch)
+            │       ↑ neon_branch_readonly uses this (enforced read-only)
+            │
+            ├── Dirty Branch (session-scoped child, shared across ALL workers)
+            │       ↑ neon_branch_dirty uses this
+            │
+            └── Isolated Branch (one per xdist worker, lazily created)
+                    ↑ neon_branch_isolated uses this, reset after each test
+```
+
 ## Dependencies
 
-- Core: `pytest`, `neon-api`, `requests`
+- Core: `pytest`, `neon-api`, `requests`, `filelock`
 - Optional extras: `psycopg2`, `psycopg`, `sqlalchemy` - for convenience fixtures
 
 ## Important Patterns
 
+### Modular Architecture
+
+The plugin uses a service-oriented architecture for testability:
+
+- **NeonConfig**: Dataclass for configuration extraction from pytest config
+- **NeonBranchManager**: Manages all Neon API operations (branch create/delete, endpoint create, password reset)
+- **XdistCoordinator**: Handles worker synchronization with file locks and JSON caching
+- **EnvironmentManager**: Manages DATABASE_URL environment variable lifecycle
+
 ### Fixture Scopes
-- `_neon_migration_branch`: `scope="session"` - internal, parent for all test branches, migrations run here
-- `neon_apply_migrations`: `scope="session"` - user overrides to run migrations
-- `_neon_branch_for_reset`: `scope="session"` - internal, creates one branch per session from migration branch
-- `neon_branch_readwrite`: `scope="function"` - resets branch after each test (for write tests)
-- `neon_branch_readonly`: `scope="function"` - NO reset (for read-only tests, faster)
-- `neon_branch`: `scope="function"` - deprecated alias for `neon_branch_readwrite`
-- `neon_branch_shared`: `scope="module"` - one branch per test file, no reset
-- Connection fixtures: `scope="function"` (default) - fresh connection per test
+- `_neon_config`: `scope="session"` - Configuration extracted from pytest config
+- `_neon_branch_manager`: `scope="session"` - Branch lifecycle manager
+- `_neon_xdist_coordinator`: `scope="session"` - Worker synchronization
+- `_neon_migration_branch`: `scope="session"` - Parent for all test branches, migrations run here
+- `neon_apply_migrations`: `scope="session"` - User overrides to run migrations
+- `_neon_migrations_synchronized`: `scope="session"` - Signals migration completion across workers
+- `_neon_dirty_branch`: `scope="session"` - Internal, shared across ALL workers
+- `_neon_readonly_endpoint`: `scope="session"` - Internal, read_only endpoint on migration branch
+- `_neon_isolated_branch`: `scope="session"` - Internal, one per xdist worker
+- `neon_branch_readonly`: `scope="session"` - User-facing, true read-only access
+- `neon_branch_dirty`: `scope="session"` - User-facing, shared state across workers
+- `neon_branch_isolated`: `scope="function"` - User-facing, reset after each test
+- `neon_branch_readwrite`: `scope="function"` - Deprecated alias for isolated
+- `neon_branch`: `scope="function"` - Deprecated alias for isolated
+- `neon_branch_shared`: `scope="module"` - One branch per test file, no reset
+- Connection fixtures: `scope="function"` (default) - Fresh connection per test
 
 ### Environment Variable Handling
-The `_create_neon_branch` function sets `DATABASE_URL` (or configured env var) during the fixture lifecycle and restores the original value in the finally block. This is critical for not polluting other tests.
+The `EnvironmentManager` class handles `DATABASE_URL` lifecycle:
+- Sets environment variable when fixture starts
+- Saves original value for restoration
+- Restores original value (or removes) when fixture ends
 
-### Smart Migration Detection (Cost Optimization)
-The plugin avoids creating unnecessary branches through a two-layer detection strategy:
-
-1. **Sentinel detection**: If `neon_apply_migrations` is not overridden, it returns `_MIGRATIONS_NOT_DEFINED` sentinel. No child branch is created.
-
-2. **Schema fingerprint comparison**: If migrations are defined, the plugin captures `information_schema.columns` before migrations run and compares after. Only creates a child branch if the schema actually changed.
-
-**Design philosophy**: Users who define a migration fixture but rarely have actual pending migrations shouldn't pay for an extra branch every test run. The schema fingerprint approach detects actual changes, not just "migration code ran."
-
-**Implementation notes**:
-- Pre-migration fingerprint is captured in `_neon_migration_branch` and stored on `request.config`
-- Post-migration comparison happens in `_neon_branch_for_reset`
-- Falls back to assuming changes if no psycopg/psycopg2 is available for fingerprinting
-- Only checks schema (tables, columns), not data - this is intentional since seeding is not the use case
+### xdist Worker Synchronization
+The `XdistCoordinator` handles sharing resources across workers:
+- Uses file locks (`filelock`) for coordination
+- Stores shared resource data in JSON files
+- `coordinate_resource()` ensures only one worker creates shared resources
+- `wait_for_signal()` / `send_signal()` for migration synchronization
 
 ### Error Messages
 Convenience fixtures use `pytest.fail()` with detailed, formatted error messages when dependencies are missing. Keep this pattern - users need clear guidance on how to fix import errors.

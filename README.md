@@ -52,7 +52,7 @@ export NEON_PROJECT_ID="your-project-id"
 2. Write tests:
 
 ```python
-def test_user_creation(neon_branch_readwrite):
+def test_user_creation(neon_branch_isolated):
     # DATABASE_URL is automatically set to the test branch
     import psycopg  # Your own install
 
@@ -73,12 +73,40 @@ pytest
 
 **Which fixture should I use?**
 
-- **Use `neon_branch_readonly`** if your test only reads data (SELECT queries). This is the fastest option with no per-test overhead.
-- **Use `neon_branch_readwrite`** if your test modifies data (INSERT, UPDATE, DELETE). This resets the branch after each test for isolation.
+| Fixture | Scope | Reset | Best For | Overhead |
+|---------|-------|-------|----------|----------|
+| `neon_branch_readonly` | session | None | Read-only tests (SELECT) - enforced | ~0s/test |
+| `neon_branch_dirty` | session | None | Fast writes, shared state OK | ~0s/test |
+| `neon_branch_isolated` | function | After each test | Write tests needing isolation | ~0.5s/test |
+| `neon_branch_shared` | module | None | Module-level shared state | ~0s/test |
 
-### `neon_branch_readonly` (recommended, fastest)
+**Quick guide:**
+- **Use `neon_branch_readonly`** if your test only reads data (SELECT queries). This uses a true read-only endpoint that enforces read-only access at the database level. Any write attempt will fail with a database error.
+- **Use `neon_branch_dirty`** if your tests write data but can tolerate shared state across the session. Fast because no reset or branch creation per test.
+- **Use `neon_branch_isolated`** if your test modifies data and needs isolation from other tests. Resets the branch after each test.
 
-**Use this fixture by default** if your tests don't need to write data. It provides the best performance by skipping the branch reset step (~0.5s saved per test), which also reduces API calls and avoids rate limiting issues.
+### Architecture
+
+The plugin creates a branch hierarchy to efficiently support all fixture types:
+
+```
+Parent Branch (configured or project default)
+    └── Migration Branch (session-scoped, read_write endpoint)
+            │   ↑ migrations run here ONCE
+            │
+            ├── Read-only Endpoint (read_only endpoint ON migration branch)
+            │       ↑ neon_branch_readonly uses this (enforced read-only)
+            │
+            ├── Dirty Branch (session-scoped child, shared across ALL workers)
+            │       ↑ neon_branch_dirty uses this
+            │
+            └── Isolated Branch (one per xdist worker, lazily created)
+                    ↑ neon_branch_isolated uses this, reset after each test
+```
+
+### `neon_branch_readonly` (session-scoped, enforced read-only)
+
+**Use this fixture** for tests that only read data. It uses a true `read_only` endpoint on the migration branch, which enforces read-only access at the database level. Any attempt to INSERT, UPDATE, or DELETE will result in a database error.
 
 ```python
 def test_query_users(neon_branch_readonly):
@@ -87,57 +115,115 @@ def test_query_users(neon_branch_readonly):
     with psycopg.connect(neon_branch_readonly.connection_string) as conn:
         result = conn.execute("SELECT * FROM users").fetchall()
         assert len(result) >= 0
-    # No reset after this test - fast!
+
+        # This would fail with a database error:
+        # conn.execute("INSERT INTO users (name) VALUES ('test')")
 ```
 
 **Use this when**:
 - Tests only perform SELECT queries
 - Tests don't modify database state
-- You want maximum performance
+- You want maximum performance with true enforcement
 
-**Warning**: If you accidentally write data using this fixture, subsequent tests will see those modifications. The fixture does not enforce read-only access at the database level.
+**Session-scoped**: The endpoint is created once and shared across all tests and workers.
 
-**Performance**: ~1.5s initial setup per session, **no per-test overhead**. For 10 read-only tests, expect only ~1.5s total overhead (vs ~6.5s with readwrite).
+**Performance**: ~1.5s initial setup per session, **no per-test overhead**. For 10 read-only tests, expect only ~1.5s total overhead.
 
-### `neon_branch_readwrite` (for write tests)
+### `neon_branch_dirty` (session-scoped, shared state)
 
-Use this fixture when your tests need to INSERT, UPDATE, or DELETE data. Creates one branch per test session, then resets it to the parent branch's state after each test. This provides test isolation with ~0.5s overhead per test.
+Use this fixture when your tests write data but can tolerate shared state across the session. All tests share the same branch and writes persist (no cleanup between tests). This is faster than `neon_branch_isolated` because there's no reset overhead.
 
 ```python
-import os
-
-def test_insert_user(neon_branch_readwrite):
+def test_insert_user(neon_branch_dirty):
     # DATABASE_URL is set automatically
-    assert os.environ["DATABASE_URL"] == neon_branch_readwrite.connection_string
-
-    # Use with any driver
     import psycopg
-    with psycopg.connect(neon_branch_readwrite.connection_string) as conn:
+    with psycopg.connect(neon_branch_dirty.connection_string) as conn:
         conn.execute("INSERT INTO users (name) VALUES ('test')")
         conn.commit()
-    # Branch resets after this test - changes won't affect other tests
+    # Data persists - subsequent tests will see this user
+
+def test_count_users(neon_branch_dirty):
+    # This test sees data from previous tests
+    import psycopg
+    with psycopg.connect(neon_branch_dirty.connection_string) as conn:
+        result = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        # Count includes users from previous tests
 ```
 
-**Performance**: ~1.5s initial setup per session + ~0.5s reset per test. For 10 write tests, expect ~6.5s total overhead.
+**Use this when**:
+- Most tests can share database state without interference
+- You want maximum performance with minimal API calls
+- You manually manage test data cleanup if needed
+- You're combining it with `neon_branch_isolated` for specific tests that need clean state
+
+**Warning**: Data written by one test WILL be visible to subsequent tests AND to other xdist workers. This is truly shared - use `neon_branch_isolated` for tests that require guaranteed clean state.
+
+**pytest-xdist note**: ALL workers share the same dirty branch. Concurrent writes from different workers may conflict. This is "dirty" by design - for isolation, use `neon_branch_isolated`.
+
+**Performance**: ~1.5s initial setup per session, **no per-test overhead**. For 10 write tests, expect only ~1.5s total overhead.
+
+### `neon_branch_isolated` (function-scoped, full isolation)
+
+Use this fixture when your test modifies data and needs isolation from other tests. Each xdist worker has its own branch, and the branch is reset to the migration state after each test.
+
+```python
+def test_insert_user(neon_branch_isolated):
+    # DATABASE_URL is set automatically
+    import psycopg
+    with psycopg.connect(neon_branch_isolated.connection_string) as conn:
+        # Guaranteed clean state - no data from other tests
+        # (only migration/seed data if you defined neon_apply_migrations)
+        result = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        initial_count = result[0]
+
+        conn.execute("INSERT INTO users (name) VALUES ('test')")
+        conn.commit()
+
+        # Verify our insert worked
+        result = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+        assert result[0] == initial_count + 1
+    # Branch resets after this test - next test sees clean state
+```
+
+**Use this when**:
+- A test modifies database state (INSERT, UPDATE, DELETE)
+- Test isolation is important
+- You're combining it with `neon_branch_dirty` for most tests but need isolation for specific ones
+
+**SQLAlchemy Users**: If you create your own engine (not using the `neon_engine` fixture), you MUST use `pool_pre_ping=True`:
+
+```python
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+```
+
+Branch resets terminate server-side connections. Without `pool_pre_ping`, SQLAlchemy may reuse dead pooled connections, causing SSL errors.
+
+**pytest-xdist note**: Each worker has its own isolated branch. Resets only affect that worker's branch, so workers don't interfere with each other.
+
+**Performance**: ~1.5s initial setup per session per worker + ~0.5s reset per test. For 10 write tests, expect ~6.5s total overhead.
 
 ### `NeonBranch` dataclass
 
-Both fixtures return a `NeonBranch` dataclass with:
+All fixtures return a `NeonBranch` dataclass with:
 
 - `branch_id`: The Neon branch ID
 - `project_id`: The Neon project ID
 - `connection_string`: Full PostgreSQL connection URI
 - `host`: The database host
 - `parent_id`: The parent branch ID (used for resets)
+- `endpoint_id`: The endpoint ID (for cleanup)
+
+### `neon_branch_readwrite` (deprecated)
+
+> **Deprecated**: Use `neon_branch_isolated` instead.
+
+This fixture is an alias for `neon_branch_isolated` and will emit a deprecation warning.
 
 ### `neon_branch` (deprecated)
 
-> **Deprecated**: Use `neon_branch_readwrite` or `neon_branch_readonly` instead.
+> **Deprecated**: Use `neon_branch_isolated`, `neon_branch_dirty`, or `neon_branch_readonly` instead.
 
-This fixture is an alias for `neon_branch_readwrite` and will emit a deprecation warning. Migrate to the explicit fixture names for clarity:
-
-- `neon_branch_readwrite`: For tests that modify data (INSERT/UPDATE/DELETE)
-- `neon_branch_readonly`: For tests that only read data (SELECT)
+This fixture is an alias for `neon_branch_isolated` and will emit a deprecation warning.
 
 ### `neon_branch_shared` (module-scoped, no isolation)
 
@@ -205,21 +291,21 @@ def test_query(neon_engine):
 
 ### Using Your Own SQLAlchemy Engine
 
-If you have a module-level SQLAlchemy engine (common pattern) and use `neon_branch_readwrite`, you **must** use `pool_pre_ping=True`:
+If you have a module-level SQLAlchemy engine (common pattern) and use `neon_branch_isolated`, you **must** use `pool_pre_ping=True`:
 
 ```python
 # database.py
 from sqlalchemy import create_engine
 from config import DATABASE_URL
 
-# pool_pre_ping=True is REQUIRED when using neon_branch_readwrite
+# pool_pre_ping=True is REQUIRED when using neon_branch_isolated
 # It verifies connections are alive before using them
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 ```
 
-**Why?** After each test, `neon_branch_readwrite` resets the branch which terminates server-side connections. Without `pool_pre_ping`, SQLAlchemy may try to reuse a dead pooled connection, causing `SSL connection has been closed unexpectedly` errors.
+**Why?** After each test, `neon_branch_isolated` resets the branch which terminates server-side connections. Without `pool_pre_ping`, SQLAlchemy may try to reuse a dead pooled connection, causing `SSL connection has been closed unexpectedly` errors.
 
-**Note**: If you only use `neon_branch_readonly`, `pool_pre_ping` is not required since no resets occur.
+**Note**: If you only use `neon_branch_readonly` or `neon_branch_dirty`, `pool_pre_ping` is not required since no resets occur.
 
 This is also a best practice for any cloud database (Neon, RDS, etc.) where connections can be terminated externally.
 
@@ -227,41 +313,18 @@ This is also a best practice for any cloud database (Neon, RDS, etc.) where conn
 
 pytest-neon supports running migrations once before tests, with all test resets preserving the migrated state.
 
-### Smart Migration Detection
-
-The plugin automatically detects whether migrations actually modified the database schema. This optimization:
-
-- **Saves Neon costs**: No extra branch created when migrations don't change anything
-- **Saves branch slots**: Neon projects have branch limits; this avoids wasting them
-- **Zero configuration**: Works automatically with any migration tool
-
-**When a second branch is created:**
-- Only when `neon_apply_migrations` is overridden AND the schema actually changes
-
-**When only one branch is used:**
-- If you don't override `neon_apply_migrations` (no migrations defined)
-- If your migrations are already applied (schema unchanged)
-
-The detection works by comparing a fingerprint of `information_schema.columns` before and after migrations run.
-
 ### How It Works
 
-When migrations actually modify the schema, the plugin uses a two-branch architecture:
+The plugin always creates a migration branch from your configured parent:
 
 ```
 Parent Branch (your configured parent)
     └── Migration Branch (session-scoped)
             │   ↑ migrations run here ONCE
-            └── Test Branch (session-scoped)
-                    ↑ resets to migration branch after each test
-```
-
-When no schema changes occur, the plugin uses a single-branch architecture:
-
-```
-Parent Branch (your configured parent)
-    └── Migration/Test Branch (session-scoped)
-            ↑ resets to parent after each test
+            │
+            ├── Read-only Endpoint (for neon_branch_readonly)
+            ├── Dirty Branch (for neon_branch_dirty)
+            └── Isolated Branches (for neon_branch_isolated)
 ```
 
 This means:
@@ -424,18 +487,19 @@ jobs:
 
 ## How It Works
 
-1. At the start of the test session, the plugin creates a new Neon branch from your parent branch
-2. `DATABASE_URL` is set to point to the new branch
-3. Tests run against this isolated branch with full access to your schema and data
-4. After each test, the branch is reset to its parent state (~0.5s)
-5. After all tests complete, the branch is deleted
-6. As a safety net, branches auto-expire after 10 minutes even if cleanup fails
+1. At the start of the test session, the plugin creates a migration branch from your parent branch
+2. If defined, migrations run once on the migration branch
+3. Test branches (dirty, isolated) are created as children of the migration branch
+4. `DATABASE_URL` is set to point to the appropriate branch for each fixture
+5. For `neon_branch_isolated`, the branch is reset after each test (~0.5s)
+6. After all tests complete, branches are deleted
+7. As a safety net, branches auto-expire after 10 minutes even if cleanup fails
 
 Branches use copy-on-write storage, so you only pay for data that differs from the parent branch.
 
 ### What Reset Does
 
-The `neon_branch_readwrite` fixture uses Neon's branch restore API to reset database state after each test:
+The `neon_branch_isolated` fixture uses Neon's branch restore API to reset database state after each test:
 
 - **Data changes are reverted**: All INSERT, UPDATE, DELETE operations are undone
 - **Schema changes are reverted**: CREATE TABLE, ALTER TABLE, DROP TABLE, etc. are undone
@@ -453,15 +517,16 @@ pytest-[git-branch]-[random]-[suffix]
 ```
 
 **Examples:**
-- `pytest-main-a1b2-migrated` - Migration branch from `main`
-- `pytest-feature-auth-c3d4-test-main` - Test branch from `feature/auth`
-- `pytest-a1b2-migrated` - When not in a git repo
+- `pytest-main-a1b2-migration` - Migration branch from `main`
+- `pytest-feature-auth-c3d4-dirty` - Dirty branch from `feature/auth`
+- `pytest-main-a1b2-isolated-gw0` - Isolated branch for xdist worker 0
+- `pytest-a1b2-migration` - When not in a git repo
 
 The git branch name is sanitized (only `a-z`, `0-9`, `-`, `_` allowed) and truncated to 15 characters. This makes it easy to identify orphaned branches in the Neon console.
 
 ## Parallel Test Execution (pytest-xdist)
 
-This plugin supports parallel test execution with [pytest-xdist](https://pytest-xdist.readthedocs.io/). Each xdist worker automatically gets its own isolated branch.
+This plugin supports parallel test execution with [pytest-xdist](https://pytest-xdist.readthedocs.io/).
 
 ```bash
 # Run tests in parallel with 4 workers
@@ -470,15 +535,24 @@ pytest -n 4
 ```
 
 **How it works:**
-- Each xdist worker (gw0, gw1, gw2, etc.) creates its own branch
-- Branches are named with the worker ID suffix (e.g., `-test-gw0`, `-test-gw1`)
-- Workers run tests in parallel without database state interference
+
+| Fixture | xdist Behavior |
+|---------|----------------|
+| `neon_branch_readonly` | Shared across ALL workers (read-only endpoint) |
+| `neon_branch_dirty` | Shared across ALL workers (concurrent writes possible) |
+| `neon_branch_isolated` | One branch per worker (e.g., `-isolated-gw0`, `-isolated-gw1`) |
+
+**Key points:**
+- The migration branch is created once and shared across all workers
+- `neon_branch_readonly` and `neon_branch_dirty` share resources across workers
+- `neon_branch_isolated` creates one branch per worker for isolation
+- Workers run tests in parallel without database state interference (when using isolated)
 - All branches are cleaned up after the test session
 
 **Cost implications:**
-- Running with `-n 4` creates 4 branches (one per worker) plus the migration branch
+- Running with `-n 4` creates: 1 migration branch + 1 dirty branch + 4 isolated branches (if all workers use isolated)
 - Choose your parallelism level based on your Neon plan's branch limits
-- Each worker's branch is reset after each test using the fast reset operation (~0.5s)
+- Each worker's isolated branch is reset after each test using the fast reset operation (~0.5s)
 
 ## Troubleshooting
 
@@ -500,9 +574,9 @@ pip install pytest-neon[sqlalchemy]
 Or use the core fixtures with your own driver:
 
 ```python
-def test_example(neon_branch_readwrite):
+def test_example(neon_branch_isolated):
     import my_preferred_driver
-    conn = my_preferred_driver.connect(neon_branch_readwrite.connection_string)
+    conn = my_preferred_driver.connect(neon_branch_isolated.connection_string)
 ```
 
 ### "Neon API key not configured"
