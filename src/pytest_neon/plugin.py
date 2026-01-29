@@ -295,6 +295,17 @@ def _get_git_branch_name() -> str | None:
     return None
 
 
+def _extract_password_from_connection_string(connection_string: str) -> str:
+    """Extract password from a PostgreSQL connection string."""
+    # Format: postgresql://user:password@host/db?params
+    from urllib.parse import urlparse
+
+    parsed = urlparse(connection_string)
+    if parsed.password:
+        return parsed.password
+    raise ValueError(f"No password found in connection string: {connection_string}")
+
+
 def _get_schema_fingerprint(connection_string: str) -> tuple[tuple[Any, ...], ...]:
     """
     Get a fingerprint of the database schema for change detection.
@@ -537,9 +548,15 @@ class NeonBranchManager:
         endpoint_id = result.endpoint.id
         host = self._wait_for_endpoint(endpoint_id)
 
-        # Get password for the read_only endpoint
-        connection_string = self._reset_password_and_build_connection_string(
-            branch.branch_id, host
+        # Reuse the password from the parent branch's connection string.
+        # DO NOT call role_password_reset here - it would invalidate the
+        # password used by the parent branch's read_write endpoint, breaking
+        # any existing connections (especially in xdist where other workers
+        # may be using the cached connection string).
+        password = _extract_password_from_connection_string(branch.connection_string)
+        connection_string = (
+            f"postgresql://{self.config.role_name}:{password}@{host}/"
+            f"{self.config.database_name}?sslmode=require"
         )
 
         return NeonBranch(
@@ -1170,16 +1187,10 @@ def _create_readonly_endpoint(
 
     host = endpoint.host
 
-    # Reset password to get the password value for this endpoint
-    password_response = _retry_on_rate_limit(
-        lambda: neon.role_password_reset(
-            project_id=branch.project_id,
-            branch_id=branch.branch_id,
-            role_name=role_name,
-        ),
-        operation_name="role_password_reset_readonly",
-    )
-    password = password_response.role.password
+    # Reuse the password from the parent branch's connection string.
+    # DO NOT call role_password_reset here - it would invalidate the
+    # password used by the parent branch's read_write endpoint.
+    password = _extract_password_from_connection_string(branch.connection_string)
 
     # Build connection string for the read_only endpoint
     connection_string = (
