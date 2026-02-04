@@ -6,37 +6,22 @@ Read `README.md` for complete documentation on how to use this plugin, including
 
 ## Project Overview
 
-This is a pytest plugin that provides isolated Neon database branches for integration testing. Each test gets isolated database state via branch reset after each test.
+This is a pytest plugin that provides Neon database branches for integration testing. All tests share a single branch per session.
 
 ## Key Architecture
 
 - **Entry point**: `src/pytest_neon/plugin.py` - Contains all fixtures and pytest hooks
-- **Migration fixture**: `_neon_migration_branch` - Session-scoped, parent for all test branches
+- **Test branch fixture**: `_neon_test_branch` - Session-scoped, single branch for all tests
 - **User migration hook**: `neon_apply_migrations` - Session-scoped no-op, users override to run migrations
-- **Core fixtures**:
-  - `neon_branch_readonly` - Session-scoped, uses true read_only endpoint (enforced read-only)
-  - `neon_branch_dirty` - Session-scoped, shared across ALL xdist workers (fast, shared state)
-  - `neon_branch_isolated` - Function-scoped, per-worker branch with reset after each test (recommended for writes)
-  - `neon_branch_readwrite` - Deprecated alias for `neon_branch_isolated`
-  - `neon_branch` - Deprecated alias for `neon_branch_isolated`
-- **Shared fixture**: `neon_branch_shared` - Module-scoped, no reset between tests
+- **Main fixture**: `neon_branch` - Session-scoped, shared branch for all tests
 - **Convenience fixtures**: `neon_connection`, `neon_connection_psycopg`, `neon_engine` - Optional, require extras
 
 ## Branch Hierarchy
 
 ```
 Parent Branch (configured or project default)
-    └── Migration Branch (session-scoped, read_write endpoint)
-            │   ↑ migrations run here ONCE
-            │
-            ├── Read-only Endpoint (read_only endpoint ON migration branch)
-            │       ↑ neon_branch_readonly uses this (enforced read-only)
-            │
-            ├── Dirty Branch (session-scoped child, shared across ALL workers)
-            │       ↑ neon_branch_dirty uses this
-            │
-            └── Isolated Branch (one per xdist worker, lazily created)
-                    ↑ neon_branch_isolated uses this, reset after each test
+    └── Test Branch (session-scoped, 10-min expiry)
+            ↑ migrations run here ONCE, all tests share this
 ```
 
 ## Dependencies
@@ -51,7 +36,7 @@ Parent Branch (configured or project default)
 The plugin uses a service-oriented architecture for testability:
 
 - **NeonConfig**: Dataclass for configuration extraction from pytest config
-- **NeonBranchManager**: Manages all Neon API operations (branch create/delete, endpoint create, password reset)
+- **NeonBranchManager**: Manages Neon API operations (branch create/delete)
 - **XdistCoordinator**: Handles worker synchronization with file locks and JSON caching
 - **EnvironmentManager**: Manages DATABASE_URL environment variable lifecycle
 
@@ -59,19 +44,10 @@ The plugin uses a service-oriented architecture for testability:
 - `_neon_config`: `scope="session"` - Configuration extracted from pytest config
 - `_neon_branch_manager`: `scope="session"` - Branch lifecycle manager
 - `_neon_xdist_coordinator`: `scope="session"` - Worker synchronization
-- `_neon_migration_branch`: `scope="session"` - Parent for all test branches, migrations run here
+- `_neon_test_branch`: `scope="session"` - Internal, creates branch, yields (branch, is_creator)
 - `neon_apply_migrations`: `scope="session"` - User overrides to run migrations
-- `_neon_migrations_synchronized`: `scope="session"` - Signals migration completion across workers
-- `_neon_dirty_branch`: `scope="session"` - Internal, shared across ALL workers
-- `_neon_readonly_endpoint`: `scope="session"` - Internal, read_only endpoint on migration branch
-- `_neon_isolated_branch`: `scope="session"` - Internal, one per xdist worker
-- `neon_branch_readonly`: `scope="session"` - User-facing, true read-only access
-- `neon_branch_dirty`: `scope="session"` - User-facing, shared state across workers
-- `neon_branch_isolated`: `scope="function"` - User-facing, reset after each test
-- `neon_branch_readwrite`: `scope="function"` - Deprecated alias for isolated
-- `neon_branch`: `scope="function"` - Deprecated alias for isolated
-- `neon_branch_shared`: `scope="module"` - One branch per test file, no reset
-- Connection fixtures: `scope="function"` (default) - Fresh connection per test
+- `neon_branch`: `scope="session"` - User-facing, shared branch for all tests
+- Connection fixtures: `scope="function"` - Fresh connection per test
 
 ### Environment Variable Handling
 The `EnvironmentManager` class handles `DATABASE_URL` lifecycle:
@@ -85,9 +61,17 @@ The `XdistCoordinator` handles sharing resources across workers:
 - Stores shared resource data in JSON files
 - `coordinate_resource()` ensures only one worker creates shared resources
 - `wait_for_signal()` / `send_signal()` for migration synchronization
+- All workers share ONE branch (no per-worker branches)
 
 ### Error Messages
 Convenience fixtures use `pytest.fail()` with detailed, formatted error messages when dependencies are missing. Keep this pattern - users need clear guidance on how to fix import errors.
+
+## Test Isolation
+
+Since all tests share the same branch, users should implement their own isolation:
+1. **Transaction rollback** - Recommended for most cases
+2. **Table truncation** - For cases where transactions aren't suitable
+3. **Unique identifiers** - Use UUIDs to avoid conflicts
 
 ## Documentation
 
@@ -95,7 +79,7 @@ Important help text should be documented in BOTH:
 1. **README.md** - Full user-facing documentation
 2. **Module/fixture docstrings** - So `help(pytest_neon)` shows useful info
 
-The module docstring in `plugin.py` should include key usage notes (like the SQLAlchemy `pool_pre_ping=True` requirement). Keep docstrings and README in sync.
+The module docstring in `plugin.py` should include key usage notes. Keep docstrings and README in sync.
 
 ## Commit Messages
 - Do NOT add Claude attribution or Co-Authored-By lines

@@ -1,90 +1,11 @@
 """Tests for migration support."""
 
-import inspect
-
-from pytest_neon.plugin import _MIGRATIONS_NOT_DEFINED, neon_apply_migrations
-
-
-class TestSmartMigrationDetection:
-    """Test the sentinel-based detection for skipping unnecessary branches."""
-
-    def test_sentinel_returned_when_migrations_not_overridden(self):
-        """Default neon_apply_migrations returns sentinel to signal no override."""
-        # Get the default implementation's return behavior from source
-        source = inspect.getsource(neon_apply_migrations)
-        assert "_MIGRATIONS_NOT_DEFINED" in source
-
-    def test_sentinel_is_unique_object(self):
-        """Sentinel should be a unique object that won't match normal returns."""
-        assert _MIGRATIONS_NOT_DEFINED is not None
-        assert _MIGRATIONS_NOT_DEFINED is not False
-        assert _MIGRATIONS_NOT_DEFINED != ()
-
-    def test_user_override_does_not_return_sentinel(self, pytester):
-        """When user overrides neon_apply_migrations, it returns None (not sentinel)."""
-        pytester.makeconftest(
-            """
-            import os
-            import pytest
-            from dataclasses import dataclass
-            from pytest_neon.plugin import _MIGRATIONS_NOT_DEFINED
-
-            @dataclass
-            class FakeNeonBranch:
-                branch_id: str
-                project_id: str
-                connection_string: str
-                host: str
-                parent_id: str
-
-            @pytest.fixture(scope="session")
-            def _neon_migration_branch(request):
-                branch = FakeNeonBranch(
-                    branch_id="br-migration",
-                    project_id="proj-test",
-                    connection_string="postgresql://fake",
-                    host="test.neon.tech",
-                    parent_id="br-parent",
-                )
-                os.environ["DATABASE_URL"] = branch.connection_string
-                request.config._neon_pre_migration_fingerprint = ()
-                yield branch
-
-            @pytest.fixture(scope="session")
-            def neon_apply_migrations(_neon_migration_branch):
-                # User override - returns None implicitly, not the sentinel
-                pass
-
-            @pytest.fixture(scope="session")
-            def _neon_branch_for_reset(_neon_migration_branch, neon_apply_migrations):
-                # Verify the detection logic
-                sentinel = _MIGRATIONS_NOT_DEFINED
-                migrations_defined = neon_apply_migrations is not sentinel
-                assert migrations_defined, "User override should NOT return sentinel"
-                yield _neon_migration_branch
-
-            @pytest.fixture(scope="function")
-            def neon_branch(_neon_branch_for_reset):
-                yield _neon_branch_for_reset
-        """
-        )
-
-        pytester.makepyfile(
-            """
-            def test_migration_override_detected(neon_branch):
-                assert neon_branch.branch_id == "br-migration"
-        """
-        )
-
-        result = pytester.runpytest("-v")
-        result.assert_outcomes(passed=1)
-
 
 class TestMigrationFixtureOrder:
-    """Test that migrations run before test branches are created."""
+    """Test that migrations run before tests execute."""
 
-    def test_migrations_run_before_test_branch_created(self, pytester):
-        """Verify neon_apply_migrations is called before test branch exists."""
+    def test_migrations_run_before_tests(self, pytester):
+        """Verify neon_apply_migrations is called before tests run."""
         pytester.makeconftest(
             """
             import os
@@ -99,48 +20,38 @@ class TestMigrationFixtureOrder:
                 project_id: str
                 connection_string: str
                 host: str
-                parent_id: str
+                parent_id: str = None
 
             @pytest.fixture(scope="session")
-            def _neon_migration_branch():
-                execution_order.append("migration_branch_created")
-                branch = FakeNeonBranch(
-                    branch_id="br-migration",
-                    project_id="proj-test",
-                    connection_string="postgresql://migration",
-                    host="test.neon.tech",
-                    parent_id="br-parent",
-                )
-                os.environ["DATABASE_URL"] = branch.connection_string
-                yield branch
-
-            @pytest.fixture(scope="session")
-            def neon_apply_migrations(_neon_migration_branch):
-                execution_order.append("migrations_applied")
-                # User would run migrations here
-
-            @pytest.fixture(scope="module")
-            def _neon_branch_for_reset(_neon_migration_branch, neon_apply_migrations):
+            def _neon_test_branch():
                 execution_order.append("test_branch_created")
                 branch = FakeNeonBranch(
                     branch_id="br-test",
                     project_id="proj-test",
                     connection_string="postgresql://test",
                     host="test.neon.tech",
-                    parent_id=_neon_migration_branch.branch_id,
+                    parent_id="br-parent",
                 )
+                os.environ["DATABASE_URL"] = branch.connection_string
+                yield branch, True  # is_creator=True
+
+            @pytest.fixture(scope="session")
+            def neon_apply_migrations(_neon_test_branch):
+                execution_order.append("migrations_applied")
+                # User would run migrations here
+
+            @pytest.fixture(scope="session")
+            def neon_branch(_neon_test_branch, neon_apply_migrations):
+                execution_order.append("neon_branch_ready")
+                branch, is_creator = _neon_test_branch
                 yield branch
 
-            @pytest.fixture(scope="function")
-            def neon_branch(_neon_branch_for_reset):
-                yield _neon_branch_for_reset
-
             def pytest_sessionfinish(session, exitstatus):
-                # Verify order: migration branch -> migrations -> test branch
+                # Verify order: branch -> migrations -> ready
                 assert execution_order == [
-                    "migration_branch_created",
-                    "migrations_applied",
                     "test_branch_created",
+                    "migrations_applied",
+                    "neon_branch_ready",
                 ], f"Wrong order: {execution_order}"
         """
         )
@@ -148,9 +59,136 @@ class TestMigrationFixtureOrder:
         pytester.makepyfile(
             """
             def test_uses_branch(neon_branch):
-                assert neon_branch.parent_id == "br-migration"
+                assert neon_branch.branch_id == "br-test"
         """
         )
 
         result = pytester.runpytest("-v")
         result.assert_outcomes(passed=1)
+
+    def test_user_migration_override_is_called(self, pytester):
+        """Verify user's neon_apply_migrations override runs."""
+        pytester.makeconftest(
+            """
+            import os
+            import pytest
+            from dataclasses import dataclass
+
+            migration_ran = [False]
+
+            @dataclass
+            class FakeNeonBranch:
+                branch_id: str
+                project_id: str
+                connection_string: str
+                host: str
+                parent_id: str = None
+
+            @pytest.fixture(scope="session")
+            def _neon_test_branch():
+                branch = FakeNeonBranch(
+                    branch_id="br-test",
+                    project_id="proj-test",
+                    connection_string="postgresql://test",
+                    host="test.neon.tech",
+                    parent_id="br-parent",
+                )
+                os.environ["DATABASE_URL"] = branch.connection_string
+                yield branch, True
+
+            @pytest.fixture(scope="session")
+            def neon_apply_migrations(_neon_test_branch):
+                # User migration - this should be called
+                migration_ran[0] = True
+
+            @pytest.fixture(scope="session")
+            def neon_branch(_neon_test_branch, neon_apply_migrations):
+                branch, is_creator = _neon_test_branch
+                yield branch
+
+            def pytest_sessionfinish(session, exitstatus):
+                assert migration_ran[0], "User migration should have run"
+        """
+        )
+
+        pytester.makepyfile(
+            """
+            def test_migration_ran(neon_branch):
+                pass
+        """
+        )
+
+        result = pytester.runpytest("-v")
+        result.assert_outcomes(passed=1)
+
+
+class TestSharedBranchBehavior:
+    """Test that all tests share the same branch."""
+
+    def test_all_tests_share_branch(self, pytester):
+        """Verify all tests in a session share the same branch."""
+        pytester.makeconftest(
+            """
+            import os
+            import pytest
+            from dataclasses import dataclass
+
+            branch_create_count = [0]
+
+            @dataclass
+            class FakeNeonBranch:
+                branch_id: str
+                project_id: str
+                connection_string: str
+                host: str
+                parent_id: str = None
+
+            @pytest.fixture(scope="session")
+            def _neon_test_branch():
+                branch_create_count[0] += 1
+                branch = FakeNeonBranch(
+                    branch_id=f"br-{branch_create_count[0]}",
+                    project_id="proj-test",
+                    connection_string="postgresql://test",
+                    host="test.neon.tech",
+                    parent_id="br-parent",
+                )
+                os.environ["DATABASE_URL"] = branch.connection_string
+                yield branch, True
+
+            @pytest.fixture(scope="session")
+            def neon_apply_migrations(_neon_test_branch):
+                pass
+
+            @pytest.fixture(scope="session")
+            def neon_branch(_neon_test_branch, neon_apply_migrations):
+                branch, is_creator = _neon_test_branch
+                yield branch
+
+            def pytest_sessionfinish(session, exitstatus):
+                # Should only create ONE branch for entire session
+                assert branch_create_count[0] == 1, f"Created {branch_create_count[0]} branches"
+        """
+        )
+
+        pytester.makepyfile(
+            test_module_a="""
+            branch_ids_seen = []
+
+            def test_first(neon_branch):
+                branch_ids_seen.append(neon_branch.branch_id)
+
+            def test_second(neon_branch):
+                branch_ids_seen.append(neon_branch.branch_id)
+                # All tests see same branch
+                assert len(set(branch_ids_seen)) == 1
+        """,
+            test_module_b="""
+            def test_in_another_module(neon_branch):
+                # Same branch as module_a
+                assert neon_branch.branch_id == "br-1"
+        """,
+        )
+
+        result = pytester.runpytest("-v")
+        result.assert_outcomes(passed=3)

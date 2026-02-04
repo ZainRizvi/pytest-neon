@@ -1,9 +1,6 @@
 """Tests for git branch name in Neon branch names."""
 
-import contextlib
 from unittest.mock import MagicMock, patch
-
-from neon_api.schema import EndpointState
 
 
 class TestSanitizeBranchName:
@@ -99,39 +96,24 @@ class TestGetGitBranchName:
             assert result is None
 
 
-class TestBranchNameWithGitBranch:
-    """Tests for branch name generation with git branch."""
+class TestNeonBranchManagerCreateBranch:
+    """Tests for NeonBranchManager.create_branch method."""
 
     def test_branch_name_includes_git_branch(self):
         """Branch name includes git branch when in a repo."""
-        from pytest_neon.plugin import _create_neon_branch
+        from pytest_neon.plugin import NeonBranchManager, NeonConfig
+        from neon_api.schema import EndpointState
 
-        mock_request = MagicMock()
-        mock_config = MagicMock()
-        mock_request.config = mock_config
-
-        def mock_getoption(name, default=None):
-            if name == "neon_api_key":
-                return "test-api-key"
-            if name == "neon_project_id":
-                return "test-project"
-            if name == "neon_keep_branches":
-                return True
-            if name == "neon_branch_expiry":
-                return 0
-            return default
-
-        def mock_getini(name):
-            if name == "neon_database":
-                return "neondb"
-            if name == "neon_role":
-                return "neondb_owner"
-            if name == "neon_env_var":
-                return "DATABASE_URL"
-            return None
-
-        mock_config.getoption.side_effect = mock_getoption
-        mock_config.getini.side_effect = mock_getini
+        mock_config = NeonConfig(
+            api_key="test-api-key",
+            project_id="test-project",
+            parent_branch_id=None,
+            database_name="neondb",
+            role_name="neondb_owner",
+            keep_branches=True,
+            branch_expiry=0,
+            env_var_name="DATABASE_URL",
+        )
 
         with (
             patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
@@ -165,45 +147,32 @@ class TestBranchNameWithGitBranch:
             mock_endpoint_response.endpoint.host = "test.neon.tech"
             mock_api.endpoint.return_value = mock_endpoint_response
 
-            gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
-            with contextlib.suppress(StopIteration):
-                next(gen)
+            # Bypass default branch check
+            mock_api.branches.return_value.branches = []
+
+            manager = NeonBranchManager(mock_config)
+            manager.create_branch(name_suffix="-test")
 
             assert captured_branch_name is not None
             # Git branch "feature/my-branch" sanitized to "feature-my-branch"
             assert captured_branch_name.startswith("pytest-feature-my-bran-")
-            assert captured_branch_name.endswith("-migrated")
+            assert captured_branch_name.endswith("-test")
 
     def test_branch_name_truncates_long_git_branch(self):
         """Git branch name is truncated to 15 characters."""
-        from pytest_neon.plugin import _create_neon_branch
+        from pytest_neon.plugin import NeonBranchManager, NeonConfig
+        from neon_api.schema import EndpointState
 
-        mock_request = MagicMock()
-        mock_config = MagicMock()
-        mock_request.config = mock_config
-
-        def mock_getoption(name, default=None):
-            if name == "neon_api_key":
-                return "test-api-key"
-            if name == "neon_project_id":
-                return "test-project"
-            if name == "neon_keep_branches":
-                return True
-            if name == "neon_branch_expiry":
-                return 0
-            return default
-
-        def mock_getini(name):
-            if name == "neon_database":
-                return "neondb"
-            if name == "neon_role":
-                return "neondb_owner"
-            if name == "neon_env_var":
-                return "DATABASE_URL"
-            return None
-
-        mock_config.getoption.side_effect = mock_getoption
-        mock_config.getini.side_effect = mock_getini
+        mock_config = NeonConfig(
+            api_key="test-api-key",
+            project_id="test-project",
+            parent_branch_id=None,
+            database_name="neondb",
+            role_name="neondb_owner",
+            keep_branches=True,
+            branch_expiry=0,
+            env_var_name="DATABASE_URL",
+        )
 
         with (
             patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
@@ -237,45 +206,31 @@ class TestBranchNameWithGitBranch:
             mock_endpoint_response.endpoint.host = "test.neon.tech"
             mock_api.endpoint.return_value = mock_endpoint_response
 
-            gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
-            with contextlib.suppress(StopIteration):
-                next(gen)
+            mock_api.branches.return_value.branches = []
+
+            manager = NeonBranchManager(mock_config)
+            manager.create_branch(name_suffix="-test")
 
             assert captured_branch_name is not None
             # Long branch sanitized and truncated to first 15 chars
             assert captured_branch_name.startswith("pytest-feature-very-lo-")
-            assert captured_branch_name.endswith("-migrated")
+            assert captured_branch_name.endswith("-test")
 
     def test_branch_name_without_git(self):
         """Branch name uses old format when not in a git repo."""
-        from pytest_neon.plugin import _create_neon_branch
+        from pytest_neon.plugin import NeonBranchManager, NeonConfig
+        from neon_api.schema import EndpointState
 
-        mock_request = MagicMock()
-        mock_config = MagicMock()
-        mock_request.config = mock_config
-
-        def mock_getoption(name, default=None):
-            if name == "neon_api_key":
-                return "test-api-key"
-            if name == "neon_project_id":
-                return "test-project"
-            if name == "neon_keep_branches":
-                return True
-            if name == "neon_branch_expiry":
-                return 0
-            return default
-
-        def mock_getini(name):
-            if name == "neon_database":
-                return "neondb"
-            if name == "neon_role":
-                return "neondb_owner"
-            if name == "neon_env_var":
-                return "DATABASE_URL"
-            return None
-
-        mock_config.getoption.side_effect = mock_getoption
-        mock_config.getini.side_effect = mock_getini
+        mock_config = NeonConfig(
+            api_key="test-api-key",
+            project_id="test-project",
+            parent_branch_id=None,
+            database_name="neondb",
+            role_name="neondb_owner",
+            keep_branches=True,
+            branch_expiry=0,
+            env_var_name="DATABASE_URL",
+        )
 
         with (
             patch("pytest_neon.plugin.NeonAPI") as mock_neon_cls,
@@ -308,15 +263,16 @@ class TestBranchNameWithGitBranch:
             mock_endpoint_response.endpoint.host = "test.neon.tech"
             mock_api.endpoint.return_value = mock_endpoint_response
 
-            gen = _create_neon_branch(mock_request, branch_name_suffix="-migrated")
-            with contextlib.suppress(StopIteration):
-                next(gen)
+            mock_api.branches.return_value.branches = []
+
+            manager = NeonBranchManager(mock_config)
+            manager.create_branch(name_suffix="-test")
 
             assert captured_branch_name is not None
-            # Without git: pytest-[4 hex chars]-migrated
+            # Without git: pytest-[4 hex chars]-test
             assert captured_branch_name.startswith("pytest-")
-            assert captured_branch_name.endswith("-migrated")
-            # Format: pytest-abcd-migrated (no git branch in the middle)
+            assert captured_branch_name.endswith("-test")
+            # Format: pytest-abcd-test (no git branch in the middle)
             parts = captured_branch_name.split("-")
-            assert len(parts) == 3  # ['pytest', 'abcd', 'migrated']
+            assert len(parts) == 3  # ['pytest', 'abcd', 'test']
             assert len(parts[1]) == 4  # 2 bytes = 4 hex chars

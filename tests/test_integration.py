@@ -69,29 +69,23 @@ pytestmark = pytest.mark.skipif(
 class TestRealBranchCreation:
     """Test actual branch creation against Neon API."""
 
-    def test_branch_is_created_and_accessible(self, neon_branch_readwrite):
+    def test_branch_is_created_and_accessible(self, neon_branch):
         """Test that a real branch is created and has valid connection info."""
-        assert neon_branch_readwrite.branch_id.startswith("br-")
-        assert neon_branch_readwrite.project_id == PROJECT_ID
-        assert "neon.tech" in neon_branch_readwrite.host
-        assert neon_branch_readwrite.connection_string.startswith("postgresql://")
+        assert neon_branch.branch_id.startswith("br-")
+        assert neon_branch.project_id == PROJECT_ID
+        assert "neon.tech" in neon_branch.host
+        assert neon_branch.connection_string.startswith("postgresql://")
 
-    def test_database_url_is_set(self, neon_branch_readwrite):
+    def test_database_url_is_set(self, neon_branch):
         """Test that DATABASE_URL environment variable is set."""
-        assert os.environ.get("DATABASE_URL") == neon_branch_readwrite.connection_string
-
-    def test_readonly_fixture_works(self, neon_branch_readonly):
-        """Test that readonly fixture provides valid connection info."""
-        assert neon_branch_readonly.branch_id.startswith("br-")
-        assert neon_branch_readonly.project_id == PROJECT_ID
-        assert neon_branch_readonly.connection_string.startswith("postgresql://")
+        assert os.environ.get("DATABASE_URL") == neon_branch.connection_string
 
 
 class TestMigrations:
     """Test migration support with real Neon branches."""
 
-    def test_migrations_persist_across_resets(self, pytester, tmp_path):
-        """Test that migrations run once and persist across test resets."""
+    def test_migrations_run_and_persist(self, pytester, tmp_path):
+        """Test that migrations run once and persist for all tests."""
         # Write a conftest that tracks migration and verifies table exists
         conftest = """
 import os
@@ -101,14 +95,15 @@ import pytest
 migrations_ran = [False]
 
 @pytest.fixture(scope="session")
-def neon_apply_migrations(_neon_migration_branch):
+def neon_apply_migrations(_neon_test_branch):
     \"\"\"Create a test table via migration.\"\"\"
     try:
         import psycopg
     except ImportError:
         pytest.skip("psycopg not installed")
 
-    with psycopg.connect(_neon_migration_branch.connection_string) as conn:
+    branch, is_creator = _neon_test_branch
+    with psycopg.connect(branch.connection_string) as conn:
         with conn.cursor() as cur:
             cur.execute(\"\"\"
                 CREATE TABLE IF NOT EXISTS migration_test (
@@ -124,7 +119,7 @@ def pytest_sessionfinish(session, exitstatus):
 """
         pytester.makeconftest(conftest)
 
-        # Write tests that verify the migrated table exists and data resets
+        # Write tests that verify the migrated table exists
         pytester.makepyfile(
             """
 import psycopg
@@ -139,17 +134,17 @@ def test_first_insert(neon_branch):
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM migration_test")
             count = cur.fetchone()[0]
-            assert count == 1
+            assert count >= 1  # At least our insert
 
-def test_second_insert_after_reset(neon_branch):
-    \"\"\"After reset, table exists but previous data is gone.\"\"\"
+def test_second_insert_sees_first(neon_branch):
+    \"\"\"Second test sees data from first test (shared state).\"\"\"
     with psycopg.connect(neon_branch.connection_string) as conn:
-        # Table should still exist (from migration)
+        # Table should exist and have data from first test
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM migration_test")
             count = cur.fetchone()[0]
-            # Data from first test should be gone after reset
-            assert count == 0
+            # Data from first test should still be there (no reset)
+            assert count >= 1
 
         # Insert new data
         with conn.cursor() as cur:
@@ -165,7 +160,7 @@ def test_second_insert_after_reset(neon_branch):
 class TestRealDatabaseConnectivity:
     """Test actual database connectivity."""
 
-    def test_can_connect_and_query(self, neon_branch_readwrite):
+    def test_can_connect_and_query(self, neon_branch):
         """Test that we can actually connect to the created branch."""
         try:
             import psycopg
@@ -173,14 +168,14 @@ class TestRealDatabaseConnectivity:
             pytest.skip("psycopg not installed - run: pip install pytest-neon[psycopg]")
 
         with (
-            psycopg.connect(neon_branch_readwrite.connection_string) as conn,
+            psycopg.connect(neon_branch.connection_string) as conn,
             conn.cursor() as cur,
         ):
             cur.execute("SELECT 1 AS result")
             result = cur.fetchone()
             assert result[0] == 1
 
-    def test_can_create_and_query_table(self, neon_branch_readwrite):
+    def test_can_create_and_query_table(self, neon_branch):
         """Test that we can create tables and insert data."""
         try:
             import psycopg
@@ -188,7 +183,7 @@ class TestRealDatabaseConnectivity:
             pytest.skip("psycopg not installed - run: pip install pytest-neon[psycopg]")
 
         with (
-            psycopg.connect(neon_branch_readwrite.connection_string) as conn,
+            psycopg.connect(neon_branch.connection_string) as conn,
             conn.cursor() as cur,
         ):
             # Create a test table
@@ -213,42 +208,18 @@ class TestRealDatabaseConnectivity:
             result = cur.fetchone()
             assert result[0] == "test_value"
 
-    def test_readonly_can_query(self, neon_branch_readonly):
-        """Test that readonly fixture can execute queries."""
-        try:
-            import psycopg
-        except ImportError:
-            pytest.skip("psycopg not installed - run: pip install pytest-neon[psycopg]")
 
-        with (
-            psycopg.connect(neon_branch_readonly.connection_string) as conn,
-            conn.cursor() as cur,
-        ):
-            cur.execute("SELECT 1 AS result")
-            result = cur.fetchone()
-            assert result[0] == 1
+class TestSQLAlchemyConnections:
+    """Test SQLAlchemy connection behavior with shared branch.
 
-
-class TestSQLAlchemyPooledConnections:
-    """Test SQLAlchemy connection pooling behavior with branch resets.
-
-    Branch resets terminate server-side connections. SQLAlchemy's connection
-    pool doesn't know this, so pooled connections become stale.
-
-    Solution: Use pool_pre_ping=True (recommended for any cloud database).
-    This pings connections before use and discards stale ones automatically.
+    Since the simplified plugin doesn't reset branches between tests,
+    pool_pre_ping is no longer strictly required for stale connections.
+    However, it's still recommended for cloud databases in general.
     """
 
-    def test_pool_pre_ping_handles_stale_connections(self, pytester):
+    def test_sqlalchemy_works_with_shared_branch(self, pytester):
         """
-        Verify that pool_pre_ping=True handles stale connections after reset.
-
-        Pattern:
-        1. database.py creates engine with pool_pre_ping=True at import time
-        2. test_one uses it, connection goes to pool
-        3. Branch resets after test_one (server terminates connection)
-        4. test_two gets pooled connection, pool_pre_ping detects it's dead,
-           automatically gets fresh connection
+        Verify SQLAlchemy works correctly with shared branch.
         """
         pytester.makepyfile(
             database="""
@@ -256,17 +227,16 @@ import os
 from sqlalchemy import create_engine
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-# pool_pre_ping=True is REQUIRED for pytest-neon (and recommended for any cloud DB)
-# It verifies connections are alive before using them
+# pool_pre_ping=True is recommended for any cloud DB
 engine = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
 """
         )
 
         pytester.makepyfile(
-            test_sqlalchemy_reset="""
+            test_sqlalchemy="""
 from sqlalchemy import text
 
-def test_first_query(neon_branch_readwrite):
+def test_first_query(neon_branch):
     '''First test - creates pooled connection.'''
     from database import engine
     with engine.connect() as conn:
@@ -274,15 +244,15 @@ def test_first_query(neon_branch_readwrite):
         assert result.scalar() == 1
     # Connection returned to pool
 
-def test_second_query_after_reset(neon_branch_readwrite):
-    '''Second test - branch was reset, but pool_pre_ping handles it.'''
+def test_second_query(neon_branch):
+    '''Second test - no reset between tests, connection still valid.'''
     from database import engine
     with engine.connect() as conn:
         result = conn.execute(text("SELECT 2"))
         assert result.scalar() == 2
 
-def test_third_query_after_another_reset(neon_branch_readwrite):
-    '''Third test - still works thanks to pool_pre_ping.'''
+def test_third_query(neon_branch):
+    '''Third test - still works.'''
     from database import engine
     with engine.connect() as conn:
         result = conn.execute(text("SELECT 3"))
