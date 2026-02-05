@@ -577,12 +577,28 @@ class XdistCoordinator:
     def __init__(self, tmp_path_factory: pytest.TempPathFactory):
         self.worker_id = _get_xdist_worker_id()
         self.is_xdist = self.worker_id != "main"
+        self._worker_count: int | None = None
 
         if self.is_xdist:
             root_tmp_dir = tmp_path_factory.getbasetemp().parent
             self._lock_dir = root_tmp_dir
         else:
             self._lock_dir = None
+
+    def _get_worker_count(self) -> int:
+        """Get the total number of xdist workers."""
+        if self._worker_count is not None:
+            return self._worker_count
+
+        # PYTEST_XDIST_WORKER_COUNT is set by xdist
+        count_str = os.environ.get("PYTEST_XDIST_WORKER_COUNT")
+        if count_str:
+            self._worker_count = int(count_str)
+        else:
+            # Fallback: count from worker ID pattern (gw0, gw1, etc.)
+            # This shouldn't happen in normal xdist runs
+            self._worker_count = 1
+        return self._worker_count
 
     def coordinate_resource(
         self,
@@ -641,6 +657,53 @@ class XdistCoordinator:
 
         signal_file = self._lock_dir / f"neon_{signal_name}"
         signal_file.write_text("done")
+
+    def signal_worker_done(self) -> None:
+        """Signal that this worker has completed all tests."""
+        if not self.is_xdist or self._lock_dir is None:
+            return
+
+        done_file = self._lock_dir / f"neon_worker_done_{self.worker_id}"
+        done_file.write_text("done")
+
+    def wait_for_all_workers_done(self, timeout: float = 300) -> None:
+        """
+        Wait for all xdist workers to signal completion.
+
+        This ensures the branch isn't deleted while other workers are still
+        running tests.
+
+        Args:
+            timeout: Maximum time to wait in seconds (default: 5 minutes)
+        """
+        if not self.is_xdist or self._lock_dir is None:
+            return
+
+        worker_count = self._get_worker_count()
+        waited = 0.0
+        poll_interval = 0.5
+
+        while waited < timeout:
+            done_count = 0
+            for i in range(worker_count):
+                done_file = self._lock_dir / f"neon_worker_done_gw{i}"
+                if done_file.exists():
+                    done_count += 1
+
+            if done_count >= worker_count:
+                return
+
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+        # Timeout - log warning but proceed with cleanup anyway
+        # This prevents infinite hangs if a worker crashes
+        warnings.warn(
+            f"Timeout waiting for all workers to complete after {timeout}s. "
+            f"Only {done_count}/{worker_count} workers signaled completion. "
+            f"Proceeding with branch cleanup.",
+            stacklevel=2,
+        )
 
 
 class EnvironmentManager:
@@ -870,6 +933,10 @@ def _neon_test_branch(
     This creates a single branch with expiry that all tests share.
     The first worker creates the branch, others reuse it.
 
+    Branch cleanup is coordinated so the creator waits for ALL workers
+    to complete before deleting the branch, preventing connection errors
+    for workers that finish later.
+
     Yields:
         Tuple of (branch, is_creator) where is_creator indicates if this
         worker created the branch (and should run migrations/cleanup).
@@ -893,7 +960,13 @@ def _neon_test_branch(
         yield branch, is_creator
     finally:
         env_manager.restore()
+        # Signal that this worker is done with all tests
+        _neon_xdist_coordinator.signal_worker_done()
+
         if is_creator:
+            # Wait for all other workers to finish before deleting the branch
+            # This prevents "endpoint not found" errors for slower workers
+            _neon_xdist_coordinator.wait_for_all_workers_done()
             _neon_branch_manager.delete_branch(branch.branch_id)
 
 
