@@ -101,8 +101,9 @@ class TestNeonBranchManagerCreateBranch:
 
     def test_branch_name_includes_git_branch(self):
         """Branch name includes git branch when in a repo."""
-        from pytest_neon.plugin import NeonBranchManager, NeonConfig
         from neon_api.schema import EndpointState
+
+        from pytest_neon.plugin import NeonBranchManager, NeonConfig
 
         mock_config = NeonConfig(
             api_key="test-api-key",
@@ -160,8 +161,9 @@ class TestNeonBranchManagerCreateBranch:
 
     def test_branch_name_truncates_long_git_branch(self):
         """Git branch name is truncated to 15 characters."""
-        from pytest_neon.plugin import NeonBranchManager, NeonConfig
         from neon_api.schema import EndpointState
+
+        from pytest_neon.plugin import NeonBranchManager, NeonConfig
 
         mock_config = NeonConfig(
             api_key="test-api-key",
@@ -218,8 +220,9 @@ class TestNeonBranchManagerCreateBranch:
 
     def test_branch_name_without_git(self):
         """Branch name uses old format when not in a git repo."""
-        from pytest_neon.plugin import NeonBranchManager, NeonConfig
         from neon_api.schema import EndpointState
+
+        from pytest_neon.plugin import NeonBranchManager, NeonConfig
 
         mock_config = NeonConfig(
             api_key="test-api-key",

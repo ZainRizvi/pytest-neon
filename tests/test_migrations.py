@@ -167,7 +167,8 @@ class TestSharedBranchBehavior:
 
             def pytest_sessionfinish(session, exitstatus):
                 # Should only create ONE branch for entire session
-                assert branch_create_count[0] == 1, f"Created {branch_create_count[0]} branches"
+                count = branch_create_count[0]
+                assert count == 1, f"Created {count} branches"
         """
         )
 
